@@ -1,0 +1,1 @@
+export const AUTH_TRANSACTION_TTL_SECONDS = 15 * 60;

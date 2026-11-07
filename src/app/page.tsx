@@ -1,69 +1,47 @@
-import Image from "next/image";
+import Link from "next/link";
 
 export default function Home() {
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <main className="welcome">
+      <header className="welcome-header">
+        <Link className="brand" href="/">
+          <span className="brand-mark">N</span>
+          <span>St Jude <strong>University</strong></span>
+        </Link>
+        <Link className="button button-outline" href="/login">Portal sign in <span aria-hidden="true">↗</span></Link>
+      </header>
+
+      <section className="welcome-hero">
+        <div className="welcome-copy">
+          <span className="eyebrow"><span className="eyebrow-dot" /> STUDENT INFORMATION SYSTEM</span>
+          <h1>Your university life,<br /><em>all in one place.</em></h1>
+          <p>Welcome to St Jude University&apos;s student portal. Manage your courses, track your results, and stay connected to campus life in Uganda.</p>
+          <div className="welcome-actions">
+            <Link className="button button-primary" href="/login">Enter the portal <span aria-hidden="true">→</span></Link>
+            <Link className="text-link" href="/student/dashboard">Explore student view <span aria-hidden="true">↗</span></Link>
+          </div>
+          <div className="welcome-footnote"><span className="mini-avatar">NU</span><span>One connected campus<br /><strong>Built around your next step</strong></span></div>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+        <div className="welcome-art" aria-label="Illustration of the student portal dashboard">
+          <div className="art-orbit orbit-one" /><div className="art-orbit orbit-two" />
+          <div className="art-window">
+            <div className="art-window-top"><span /><span /><span /><b>MY CAMPUS</b></div>
+            <div className="art-window-body">
+              <div className="art-menu"><i /><i /><i /><i /><i /></div>
+              <div className="art-dashboard">
+                <small>MONDAY, OCTOBER 19</small><h3>Good morning, Alex</h3><span className="art-pill">Fall semester 2025</span>
+                <div className="art-stats"><div><small>GPA</small><b>3.82</b><span>↑ 0.14 this term</span></div><div><small>COURSES</small><b>5</b><span>15 credits</span></div></div>
+                <div className="art-course"><span className="course-block block-violet">CS</span><span><b>Data Structures</b><small>CS 240 · Room 3.14</small></span><i>10:30</i></div>
+                <div className="art-course"><span className="course-block block-gold">MA</span><span><b>Linear Algebra</b><small>MATH 221 · Room 2.08</small></span><i>13:00</i></div>
+                <div className="art-progress"><span>Semester progress</span><b>68%</b><i><span /></i></div>
+              </div>
+            </div>
+          </div>
+          <div className="floating-note"><span className="note-icon">✓</span><span><small>ENROLLMENT OPEN</small><b>Spring registration</b></span><strong>→</strong></div>
+          <div className="art-sparkle sparkle-one">✳</div><div className="art-sparkle sparkle-two">✳</div>
         </div>
-      </main>
-    </div>
+      </section>
+      <footer className="welcome-footer"><span>© 2025 St Jude University</span><span>Student success starts here.</span><span>Portal preview · Sample data</span></footer>
+    </main>
   );
 }
