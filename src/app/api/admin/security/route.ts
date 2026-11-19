@@ -2,8 +2,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { authorizeApiRequest } from "@/lib/auth/api-authorization";
 import { apiUnavailable } from "@/lib/api/students";
 import { jsonError } from "@/lib/auth/http";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import {
+  SecurityAuditLogModel,
+  UserSessionModel,
+  StudentModel,
+  StudentProfileModel,
+  UserModel,
+} from "@/lib/models";
 
 export async function GET(request: NextRequest) {
   const access = await authorizeApiRequest(request, ["ADMIN", "SUPER_ADMIN"]);
@@ -20,90 +26,92 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const admin = getSupabaseAdminClient();
-    const [
-      { data: events, error: eventsError, count: eventCount },
-      { data: sessions, error: sessionsError, count: sessionCount },
-    ] = await Promise.all([
-      admin
-        .from("security_audit_logs")
-        .select("id, actor_user_id, subject_user_id, action, entity_type, entity_id, details, created_at", { count: "exact" })
-        .order("created_at", { ascending: false })
-        .range((page - 1) * pageSize, page * pageSize - 1),
-      admin
-        .from("user_sessions")
-        .select("id, user_id, created_at, revoked_at, expires_at", { count: "exact" })
-        .order("created_at", { ascending: false })
-        .range((page - 1) * pageSize, page * pageSize - 1),
+    await connectToDatabase();
+    const skip = (page - 1) * pageSize;
+
+    const [eventTotal, events, sessionTotal, sessions] = await Promise.all([
+      SecurityAuditLogModel.countDocuments(),
+      SecurityAuditLogModel.find()
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(pageSize)
+        .select("actorUserId subjectUserId action entityType entityId details createdAt")
+        .lean(),
+      UserSessionModel.countDocuments(),
+      UserSessionModel.find()
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(pageSize)
+        .select("_id userId createdAt revokedAt expiresAt")
+        .lean(),
     ]);
-    if (eventsError || sessionsError) return apiUnavailable("Admin security log lookup failed.");
 
-    const sessionUserIds = [...new Set((sessions ?? []).map((session) => session.user_id))];
-    const { data: students, error: studentsError } = sessionUserIds.length
-      ? await admin.from("students").select("id, auth_user_id").in("auth_user_id", sessionUserIds)
-      : { data: [], error: null };
-    if (studentsError) return apiUnavailable("Admin security account lookup failed.");
-
-    const studentIds = (students ?? []).map((student) => student.id);
-    const { data: profiles, error: profilesError } = studentIds.length
-      ? await admin.from("student_profiles").select("student_id, full_name").in("student_id", studentIds)
-      : { data: [], error: null };
-    if (profilesError) return apiUnavailable("Admin security account lookup failed.");
+    const sessionUserIds = [...new Set(sessions.map((s) => s.userId.toString()))];
+    const students = sessionUserIds.length
+      ? await StudentModel.find({ authUserId: { $in: sessionUserIds } })
+          .select("_id authUserId")
+          .lean()
+      : [];
+    const studentIds = students.map((s) => s._id.toString());
+    const profiles = studentIds.length
+      ? await StudentProfileModel.find({ studentId: { $in: studentIds } })
+          .select("studentId fullName")
+          .lean()
+      : [];
 
     const profileByUserId = new Map(
-      (students ?? []).map((student) => [
-        student.auth_user_id,
-        (profiles ?? []).find((profile) => profile.student_id === student.id)?.full_name,
+      students.map((s) => [
+        s.authUserId.toString(),
+        profiles.find((p) => p.studentId.toString() === s._id.toString())?.fullName,
       ]),
     );
-    const userIds = [...new Set((sessions ?? []).map((session) => session.user_id))];
-    const namesByUserId = new Map<string, string>();
-    await Promise.all(userIds.map(async (userId) => {
-      const { data, error: userError } = await admin.auth.admin.getUserById(userId);
-      if (userError) throw new Error(`Could not load security-log account ${userId}.`);
-      namesByUserId.set(
-        userId,
-        profileByUserId.get(userId) ?? data.user.user_metadata?.full_name ?? data.user.email ?? "Name unavailable",
-      );
-    }));
 
+    // For non-student users, look up name from User model
+    const nonStudentUserIds = sessionUserIds.filter((id) => !profileByUserId.has(id));
+    const adminUsers = nonStudentUserIds.length
+      ? await UserModel.find({ _id: { $in: nonStudentUserIds } })
+          .select("_id email fullName")
+          .lean()
+      : [];
+    const adminNameById = new Map(adminUsers.map((u) => [u._id.toString(), u.fullName ?? u.email]));
+
+    const now = Date.now();
     return NextResponse.json(
       {
-        events: events ?? [],
-        sessions: (sessions ?? []).map((session) => ({
-          id: session.id,
-          userId: session.user_id,
-          userName: namesByUserId.get(session.user_id) ?? "Name unavailable",
-          loggedInAt: session.created_at,
-          loggedOutAt: session.revoked_at ?? (
-            new Date(session.expires_at).getTime() <= Date.now() ? session.expires_at : null
-          ),
-          status: session.revoked_at
+        events,
+        sessions: sessions.map((s) => ({
+          id: s._id.toString(),
+          userId: s.userId.toString(),
+          userName:
+            profileByUserId.get(s.userId.toString()) ??
+            adminNameById.get(s.userId.toString()) ??
+            "Name unavailable",
+          loggedInAt: s.createdAt,
+          loggedOutAt:
+            s.revokedAt ?? (new Date(s.expiresAt).getTime() <= now ? s.expiresAt : null),
+          status: s.revokedAt
             ? "Signed out"
-            : new Date(session.expires_at).getTime() <= Date.now()
+            : new Date(s.expiresAt).getTime() <= now
               ? "Expired"
               : "Active",
         })),
         pagination: {
           page,
           pageSize,
-          total: eventCount ?? 0,
-          totalPages: Math.ceil((eventCount ?? 0) / pageSize),
+          total: eventTotal,
+          totalPages: Math.ceil(eventTotal / pageSize),
         },
         sessionPagination: {
           page,
           pageSize,
-          total: sessionCount ?? 0,
-          totalPages: Math.ceil((sessionCount ?? 0) / pageSize),
+          total: sessionTotal,
+          totalPages: Math.ceil(sessionTotal / pageSize),
         },
       },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) {
-      return apiUnavailable("Admin security log lookup failed.");
-    }
-    console.error("Admin security log lookup failed:", error instanceof Error ? error.message : "Unknown failure.");
+    console.error("Admin security log lookup failed:", error instanceof Error ? error.message : error);
     return apiUnavailable("Admin security log lookup failed.");
   }
 }

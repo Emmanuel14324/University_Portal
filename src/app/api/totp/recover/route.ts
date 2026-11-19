@@ -6,7 +6,7 @@ import {
   TotpServiceError,
   verifyTotpRecoveryCode,
 } from "@/lib/security/totp";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
 import { totpRecoveryCodeSchema } from "@/lib/validation/auth";
 
 export async function POST(request: NextRequest) {
@@ -21,10 +21,7 @@ export async function POST(request: NextRequest) {
   if (!parsed.success) return jsonError("Enter one of your saved recovery codes.", 400);
 
   try {
-    const result = await verifyTotpRecoveryCode(
-      transactionToken,
-      parsed.data.recoveryCode,
-    );
+    const result = await verifyTotpRecoveryCode(transactionToken, parsed.data.recoveryCode);
     if (result.kind === "expired") {
       const response = jsonError("The authentication transaction expired.", 401);
       response.cookies.delete(cookieName);
@@ -48,7 +45,7 @@ export async function POST(request: NextRequest) {
     response.cookies.set(cookieName, result.transactionToken, getTotpCookieSettings());
     return response;
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) {
+    if (error instanceof MongoConfigurationError) {
       return jsonError("Authentication service is not configured.", 503);
     }
     if (error instanceof TotpServiceError) {

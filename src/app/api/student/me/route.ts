@@ -1,42 +1,31 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authorizeApiRequest } from "@/lib/auth/api-authorization";
 import { apiUnavailable, getActiveStudentIdentity, StudentApiError } from "@/lib/api/students";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
 import { jsonError } from "@/lib/auth/http";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import { StudentProfileModel, ProgrammeModel, UserModel } from "@/lib/models";
+import mongoose from "mongoose";
 
 export async function GET(request: NextRequest) {
   const access = await authorizeApiRequest(request, ["STUDENT"]);
   if (access.response) return access.response;
 
   try {
-    const admin = getSupabaseAdminClient();
     const student = await getActiveStudentIdentity(access.session.id);
     if (!student) return jsonError("An active student account is required.", 403);
 
-    const [
-      { data: profile, error: profileError },
-      { data: programme, error: programmeError },
-      { data: authUser, error: authUserError },
-    ] = await Promise.all([
-      admin
-        .from("student_profiles")
-        .select("full_name, phone_number, date_of_birth, address, emergency_contact_name, emergency_contact_phone")
-        .eq("student_id", student.id)
-        .maybeSingle(),
+    await connectToDatabase();
+    const [profile, programme, user] = await Promise.all([
+      StudentProfileModel.findOne({ studentId: new mongoose.Types.ObjectId(student.id) })
+        .select("fullName phoneNumber dateOfBirth address emergencyContactName emergencyContactPhone")
+        .lean(),
       student.programme_id
-        ? admin
-            .from("programmes")
-            .select("code, name, award, department, duration_years")
-            .eq("id", student.programme_id)
-            .maybeSingle()
-        : Promise.resolve({ data: null, error: null }),
-      admin.auth.admin.getUserById(access.session.id),
+        ? ProgrammeModel.findById(student.programme_id)
+            .select("code name award department durationYears")
+            .lean()
+        : null,
+      UserModel.findById(access.session.id).select("email").lean(),
     ]);
-
-    if (profileError || programmeError || authUserError) {
-      return apiUnavailable("Student profile lookup failed.");
-    }
 
     return NextResponse.json(
       {
@@ -45,7 +34,7 @@ export async function GET(request: NextRequest) {
           admissionYear: student.admission_year,
           yearOfStudy: student.year_of_study,
           status: student.status,
-          email: authUser.user.email ?? null,
+          email: user?.email ?? null,
           profile,
           programme,
         },
@@ -53,9 +42,7 @@ export async function GET(request: NextRequest) {
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError || error instanceof StudentApiError) {
-      return apiUnavailable("Student identity lookup failed.");
-    }
+    if (error instanceof StudentApiError) return apiUnavailable("Student identity lookup failed.");
     throw error;
   }
 }

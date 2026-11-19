@@ -5,7 +5,7 @@ import {
   PasswordLoginUnavailableError,
 } from "@/lib/auth/password-login";
 import { isSameOriginRequest, jsonError } from "@/lib/auth/http";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
 import { passwordLoginSchema } from "@/lib/validation/auth";
 
 export async function POST(request: NextRequest) {
@@ -34,7 +34,6 @@ export async function POST(request: NextRequest) {
     if (result.kind === "invalid_credentials") {
       return jsonError("Invalid registration number/email or password.", 401);
     }
-
     if (result.kind === "rate_limited") {
       return jsonError("Too many login attempts. Try again later.", 429, {
         "Retry-After": String(result.retryAfter),
@@ -56,15 +55,13 @@ export async function POST(request: NextRequest) {
     });
     return response;
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) {
+    if (error instanceof MongoConfigurationError) {
       return jsonError("Authentication service is not configured.", 503);
     }
-
     if (error instanceof PasswordLoginUnavailableError) {
       console.error("Password login unavailable:", error.message);
       return jsonError("Authentication service is temporarily unavailable.", 503);
     }
-
     throw error;
   }
 }

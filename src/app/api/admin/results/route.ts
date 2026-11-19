@@ -1,13 +1,21 @@
+import mongoose from "mongoose";
 import { NextRequest, NextResponse } from "next/server";
 import { authorizeApiRequest } from "@/lib/auth/api-authorization";
 import { apiUnavailable } from "@/lib/api/students";
 import { isSameOriginRequest, jsonError, readJson } from "@/lib/auth/http";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import {
+  ExaminationResultModel,
+  StudentModel,
+  CourseRegistrationModel,
+  CourseModel,
+  SemesterModel,
+  StudentProfileModel,
+} from "@/lib/models";
 import { z } from "zod";
 
 const recordResultSchema = z.object({
-  courseRegistrationId: z.string().uuid(),
+  courseRegistrationId: z.string(),
   marks: z.number().min(0).max(100),
   grade: z.string().regex(/^[A-F][+]?-?$/),
   gradePoints: z.number().min(0).max(5),
@@ -19,93 +27,105 @@ export async function GET(request: NextRequest) {
   if (access.response) return access.response;
 
   try {
-    const admin = getSupabaseAdminClient();
-    const [
-      { data: results, error: resultError },
-      { count: activeStudents, error: studentCountError },
-      { data: activeRegistrations, error: activeRegistrationError },
-    ] = await Promise.all([
-      admin.from("examination_results")
-        .select("course_registration_id, marks, grade, grade_points, status, published_at, created_at")
-        .order("created_at", { ascending: false })
-        .limit(100),
-      admin.from("students").select("id", { count: "exact", head: true }).eq("status", "ACTIVE"),
-      admin.from("course_registrations")
-        .select("id, course_id, semester_id, student_id")
-        .eq("status", "REGISTERED")
-        .order("registered_at", { ascending: false })
-        .limit(500),
+    await connectToDatabase();
+    const [results, activeStudentCount, activeRegistrations] = await Promise.all([
+      ExaminationResultModel.find()
+        .sort({ createdAt: -1 })
+        .limit(100)
+        .select("courseRegistrationId marks grade gradePoints status publishedAt createdAt")
+        .lean(),
+      StudentModel.countDocuments({ status: "ACTIVE" }),
+      CourseRegistrationModel.find({ status: "REGISTERED" })
+        .sort({ registeredAt: -1 })
+        .limit(500)
+        .select("_id courseId semesterId studentId")
+        .lean(),
     ]);
-    if (resultError || studentCountError || activeRegistrationError) return apiUnavailable("Admin results lookup failed.");
 
-    const resultRows = results ?? [];
-    const allRegistrations = activeRegistrations ?? [];
-    const registrationIds = [...new Set([
-      ...resultRows.map((item) => item.course_registration_id),
-      ...allRegistrations.map((item) => item.id),
-    ])];
-    const [{ data: registrations, error: registrationError }] = registrationIds.length
-      ? await Promise.all([
-          admin.from("course_registrations")
-            .select("id, course_id, semester_id, student_id")
-            .in("id", registrationIds),
-        ])
-      : [{ data: [], error: null }];
-    if (registrationError) return apiUnavailable("Admin results registration lookup failed.");
-    const registrationRows = registrations ?? [];
-    const courseIds = [...new Set(registrationRows.map((row) => row.course_id))];
-    const semesterIds = [...new Set(registrationRows.map((row) => row.semester_id))];
-    const studentIds = [...new Set(registrationRows.map((row) => row.student_id))];
-    const [
-      { data: courses, error: courseError },
-      { data: semesters, error: semesterError },
-      { data: students, error: studentsError },
-      { data: profiles, error: profileError },
-    ] = await Promise.all([
-      courseIds.length ? admin.from("courses").select("id, code, name, credit_units").in("id", courseIds) : Promise.resolve({ data: [], error: null }),
-      semesterIds.length ? admin.from("semesters").select("id, academic_year, name").in("id", semesterIds) : Promise.resolve({ data: [], error: null }),
-      studentIds.length ? admin.from("students").select("id, registration_number").in("id", studentIds) : Promise.resolve({ data: [], error: null }),
-      studentIds.length ? admin.from("student_profiles").select("student_id, full_name").in("student_id", studentIds) : Promise.resolve({ data: [], error: null }),
+    const allRegistrationIds = [
+      ...new Set([
+        ...results.map((r) => r.courseRegistrationId.toString()),
+        ...activeRegistrations.map((r) => r._id.toString()),
+      ]),
+    ];
+
+    const registrations = allRegistrationIds.length
+      ? await CourseRegistrationModel.find({ _id: { $in: allRegistrationIds } })
+          .select("_id courseId semesterId studentId")
+          .lean()
+      : [];
+
+    const courseIds = [...new Set(registrations.map((r) => r.courseId.toString()))];
+    const semesterIds = [...new Set(registrations.map((r) => r.semesterId.toString()))];
+    const studentIds = [...new Set(registrations.map((r) => r.studentId.toString()))];
+
+    const [courses, semesters, students, profiles] = await Promise.all([
+      courseIds.length
+        ? CourseModel.find({ _id: { $in: courseIds } }).select("_id code name creditUnits").lean()
+        : [],
+      semesterIds.length
+        ? SemesterModel.find({ _id: { $in: semesterIds } }).select("_id academicYear name").lean()
+        : [],
+      studentIds.length
+        ? StudentModel.find({ _id: { $in: studentIds } }).select("_id registrationNumber").lean()
+        : [],
+      studentIds.length
+        ? StudentProfileModel.find({ studentId: { $in: studentIds } })
+            .select("studentId fullName")
+            .lean()
+        : [],
     ]);
-    if (courseError || semesterError || studentsError || profileError) return apiUnavailable("Admin results details lookup failed.");
 
-    const registrationById = new Map(registrationRows.map((item) => [item.id, item]));
-    const courseById = new Map((courses ?? []).map((item) => [item.id, item]));
-    const semesterById = new Map((semesters ?? []).map((item) => [item.id, item]));
-    const studentById = new Map((students ?? []).map((item) => [item.id, item]));
-    const profileByStudent = new Map((profiles ?? []).map((item) => [item.student_id, item]));
-    const listedResults = resultRows.flatMap((result) => {
-      const registration = registrationById.get(result.course_registration_id);
-      if (!registration) return [];
+    const registrationById = new Map(registrations.map((r) => [r._id.toString(), r]));
+    const courseById = new Map(courses.map((c) => [c._id.toString(), c]));
+    const semesterById = new Map(semesters.map((s) => [s._id.toString(), s]));
+    const studentById = new Map(students.map((s) => [s._id.toString(), s]));
+    const profileByStudent = new Map(profiles.map((p) => [p.studentId.toString(), p]));
+
+    const listedResults = results.flatMap((result) => {
+      const reg = registrationById.get(result.courseRegistrationId.toString());
+      if (!reg) return [];
       return [{
-        ...result,
-        course: courseById.get(registration.course_id) ?? null,
-        semester: semesterById.get(registration.semester_id) ?? null,
+        courseRegistrationId: result.courseRegistrationId.toString(),
+        marks: result.marks,
+        grade: result.grade,
+        gradePoints: result.gradePoints,
+        status: result.status,
+        publishedAt: result.publishedAt,
+        createdAt: result.createdAt,
+        course: courseById.get(reg.courseId.toString()) ?? null,
+        semester: semesterById.get(reg.semesterId.toString()) ?? null,
         student: {
-          registrationNumber: studentById.get(registration.student_id)?.registration_number ?? "—",
-          fullName: profileByStudent.get(registration.student_id)?.full_name ?? "Name unavailable",
+          registrationNumber: studentById.get(reg.studentId.toString())?.registrationNumber ?? "—",
+          fullName: profileByStudent.get(reg.studentId.toString())?.fullName ?? "Name unavailable",
         },
       }];
     });
-    const registrationChoices = allRegistrations.map((registration) => ({
-      id: registration.id,
-      studentName: profileByStudent.get(registration.student_id)?.full_name ?? "Name unavailable",
-      registrationNumber: studentById.get(registration.student_id)?.registration_number ?? "—",
-      course: courseById.get(registration.course_id)?.code ?? "Course unavailable",
-      semester: semesterById.get(registration.semester_id)
-        ? `${semesterById.get(registration.semester_id)?.academic_year} · ${semesterById.get(registration.semester_id)?.name}`
-        : "Semester unavailable",
+
+    const registrationChoices = activeRegistrations.map((reg) => ({
+      id: reg._id.toString(),
+      studentName: profileByStudent.get(reg.studentId.toString())?.fullName ?? "Name unavailable",
+      registrationNumber: studentById.get(reg.studentId.toString())?.registrationNumber ?? "—",
+      course: courseById.get(reg.courseId.toString())?.code ?? "Course unavailable",
+      semester: (() => {
+        const sem = semesterById.get(reg.semesterId.toString());
+        return sem ? `${sem.academicYear} · ${sem.name}` : "Semester unavailable";
+      })(),
     }));
-    return NextResponse.json({
-      results: listedResults,
-      registrations: registrationChoices,
-      activeStudents: activeStudents ?? 0,
-      pendingCount: listedResults.filter((item) => item.status === "DRAFT").length,
-      publishedCount: listedResults.filter((item) => item.status === "PUBLISHED").length,
-    }, { headers: { "Cache-Control": "no-store" } });
+
+    return NextResponse.json(
+      {
+        results: listedResults,
+        registrations: registrationChoices,
+        activeStudents: activeStudentCount,
+        pendingCount: listedResults.filter((r) => r.status === "DRAFT").length,
+        publishedCount: listedResults.filter((r) => r.status === "PUBLISHED").length,
+      },
+      { headers: { "Cache-Control": "no-store" } },
+    );
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) return apiUnavailable("Admin results lookup failed.");
-    throw error;
+    console.error("Admin results lookup failed:", error instanceof Error ? error.message : error);
+    return apiUnavailable("Admin results lookup failed.");
   }
 }
 
@@ -113,34 +133,36 @@ export async function POST(request: NextRequest) {
   if (!isSameOriginRequest(request)) return jsonError("Cross-origin requests are not allowed.", 403);
   const access = await authorizeApiRequest(request, ["ADMIN", "SUPER_ADMIN"]);
   if (access.response) return access.response;
+
   const parsed = recordResultSchema.safeParse(await readJson(request));
   if (!parsed.success) return jsonError("Provide a valid course registration, mark, grade, and grade point value.", 400);
 
   try {
-    const admin = getSupabaseAdminClient();
-    const { data: registration, error: registrationError } = await admin.from("course_registrations")
-      .select("id")
-      .eq("id", parsed.data.courseRegistrationId)
-      .eq("status", "REGISTERED")
-      .maybeSingle();
-    if (registrationError) return apiUnavailable("Could not verify the course registration.");
+    await connectToDatabase();
+    const registration = await CourseRegistrationModel.findOne({
+      _id: new mongoose.Types.ObjectId(parsed.data.courseRegistrationId),
+      status: "REGISTERED",
+    }).lean();
     if (!registration) return jsonError("The course registration is not active.", 404);
-    const { data: result, error } = await admin.from("examination_results")
-      .upsert({
-        course_registration_id: parsed.data.courseRegistrationId,
+
+    const result = await ExaminationResultModel.findOneAndUpdate(
+      { courseRegistrationId: registration._id },
+      {
+        courseRegistrationId: registration._id,
         marks: parsed.data.marks,
         grade: parsed.data.grade,
-        grade_points: parsed.data.gradePoints,
+        gradePoints: parsed.data.gradePoints,
         status: parsed.data.publish ? "PUBLISHED" : "DRAFT",
-        published_at: parsed.data.publish ? new Date().toISOString() : null,
-        recorded_by: access.session.id,
-      }, { onConflict: "course_registration_id" })
-      .select("course_registration_id, marks, grade, grade_points, status, published_at")
-      .single();
-    if (error || !result) return apiUnavailable("Could not save the examination result.");
+        publishedAt: parsed.data.publish ? new Date() : null,
+        recordedBy: new mongoose.Types.ObjectId(access.session.id),
+      },
+      { upsert: true, new: true },
+    ).lean();
+
+    if (!result) return apiUnavailable("Could not save the examination result.");
     return NextResponse.json({ result }, { status: 201, headers: { "Cache-Control": "no-store" } });
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) return apiUnavailable("Results service is not configured.");
-    throw error;
+    console.error("Admin result recording failed:", error instanceof Error ? error.message : error);
+    return apiUnavailable("Could not save the examination result.");
   }
 }

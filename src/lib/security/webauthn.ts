@@ -1,5 +1,5 @@
 import "server-only";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -9,10 +9,18 @@ import {
   type RegistrationResponseJSON,
   type WebAuthnCredential,
 } from "@simplewebauthn/server";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
-import { hashTransactionToken } from "@/lib/security/totp";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
+import {
+  AuthChallengeModel,
+  UserRoleModel,
+  StudentModel,
+  StudentProfileModel,
+  WebAuthnCredentialModel,
+  UserModel,
+} from "@/lib/models";
 import { hasAttemptsRemaining } from "@/lib/auth/policies";
+
 const MAX_WEBAUTHN_ATTEMPTS = 5;
 
 export class WebAuthnServiceError extends Error {
@@ -22,33 +30,35 @@ export class WebAuthnServiceError extends Error {
   }
 }
 
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
 function getRelyingPartyConfig() {
   const rpID = process.env.WEBAUTHN_RP_ID;
   const origin = process.env.WEBAUTHN_ORIGIN;
   if (!rpID || !origin) {
-    throw new SupabaseConfigurationError(
+    throw new MongoConfigurationError(
       "Set WEBAUTHN_RP_ID and WEBAUTHN_ORIGIN for passkey verification.",
     );
   }
-
   let parsedOrigin: URL;
   try {
     parsedOrigin = new URL(origin);
   } catch {
-    throw new SupabaseConfigurationError("WEBAUTHN_ORIGIN must be a valid absolute URL.");
+    throw new MongoConfigurationError("WEBAUTHN_ORIGIN must be a valid absolute URL.");
   }
-
   if (
     (parsedOrigin.protocol !== "https:" && parsedOrigin.protocol !== "http:") ||
     (process.env.NODE_ENV === "production" && parsedOrigin.protocol !== "https:")
   ) {
-    throw new SupabaseConfigurationError(
+    throw new MongoConfigurationError(
       "WebAuthn must use HTTPS in production; HTTP is only permitted for local development.",
     );
   }
   if (parsedOrigin.hostname !== rpID && !parsedOrigin.hostname.endsWith(`.${rpID}`)) {
-    throw new SupabaseConfigurationError(
-      "WEBAUTHN_RP_ID must match WEBAUTHN_ORIGIN's hostname or a parent domain.",
+    throw new MongoConfigurationError(
+      "WEBAUTHN_RP_ID must match WEBAUTHN_ORIGIN hostname or a parent domain.",
     );
   }
   return { rpID, origin: parsedOrigin.origin };
@@ -60,158 +70,127 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isRegistrationResponse(value: unknown): value is RegistrationResponseJSON {
   if (!isRecord(value) || !isRecord(value.response)) return false;
-  const response = value.response;
+  const r = value.response;
   return (
     value.type === "public-key" &&
     typeof value.id === "string" &&
     typeof value.rawId === "string" &&
-    typeof response.clientDataJSON === "string" &&
-    typeof response.attestationObject === "string" &&
+    typeof r.clientDataJSON === "string" &&
+    typeof r.attestationObject === "string" &&
     isRecord(value.clientExtensionResults)
   );
 }
 
 function isAuthenticationResponse(value: unknown): value is AuthenticationResponseJSON {
   if (!isRecord(value) || !isRecord(value.response)) return false;
-  const response = value.response;
+  const r = value.response;
   return (
     value.type === "public-key" &&
     typeof value.id === "string" &&
     typeof value.rawId === "string" &&
-    typeof response.clientDataJSON === "string" &&
-    typeof response.authenticatorData === "string" &&
-    typeof response.signature === "string" &&
+    typeof r.clientDataJSON === "string" &&
+    typeof r.authenticatorData === "string" &&
+    typeof r.signature === "string" &&
     isRecord(value.clientExtensionResults)
   );
 }
 
 function getTransactionCookieName() {
-  return process.env.NODE_ENV === "production"
-    ? "__Host-stj-auth-tx"
-    : "stj-auth-tx";
+  return process.env.NODE_ENV === "production" ? "__Host-stj-auth-tx" : "stj-auth-tx";
 }
 
 async function findWebAuthnTransaction(token: string, factor: string) {
-  const admin = getSupabaseAdminClient();
-  const { data: transaction, error } = await admin
-    .from("authentication_challenges")
-    .select("id, auth_transaction_id, user_id, webauthn_challenge, expires_at, failed_attempts")
-    .eq("challenge_hash", hashTransactionToken(token))
-    .eq("factor", factor)
-    .is("consumed_at", null)
-    .maybeSingle();
+  await connectToDatabase();
+  const transaction = await AuthChallengeModel.findOne({
+    challengeHash: hashToken(token),
+    factor,
+    consumedAt: null,
+  }).lean();
 
-  if (error) throw new WebAuthnServiceError("Could not load the WebAuthn transaction.");
   if (
-    !transaction?.user_id ||
-    !Number.isFinite(new Date(transaction.expires_at).getTime()) ||
-    new Date(transaction.expires_at).getTime() <= Date.now()
+    !transaction?.userId ||
+    !Number.isFinite(new Date(transaction.expiresAt).getTime()) ||
+    new Date(transaction.expiresAt).getTime() <= Date.now()
   ) {
     return null;
   }
-  return { admin, transaction };
+  return transaction;
 }
 
-async function saveChallenge(
-  admin: ReturnType<typeof getSupabaseAdminClient>,
-  id: string,
-  challenge: string,
-) {
-  const { data, error } = await admin
-    .from("authentication_challenges")
-    .update({ webauthn_challenge: challenge })
-    .eq("id", id)
-    .is("consumed_at", null)
-    .select("id")
-    .maybeSingle();
-  if (error) throw new WebAuthnServiceError("Could not persist the WebAuthn challenge.");
-  return Boolean(data);
+async function saveChallenge(id: string, challenge: string) {
+  const result = await AuthChallengeModel.findOneAndUpdate(
+    { _id: id, consumedAt: null },
+    { webauthnChallenge: challenge },
+  );
+  return result !== null;
 }
 
-async function recordFailedAttempt(
-  admin: ReturnType<typeof getSupabaseAdminClient>,
-  transaction: { id: string; failed_attempts: number },
-) {
-  const { error } = await admin
-    .from("authentication_challenges")
-    .update({ failed_attempts: transaction.failed_attempts + 1 })
-    .eq("id", transaction.id)
-    .eq("failed_attempts", transaction.failed_attempts)
-    .is("consumed_at", null);
-  if (error) throw new WebAuthnServiceError("Could not record a passkey attempt.");
+async function recordFailedAttempt(transactionId: string, currentCount: number) {
+  await AuthChallengeModel.findByIdAndUpdate(transactionId, {
+    $inc: { failedAttempts: 1 },
+  });
 }
+
+async function consumeAndCreateCompletion(transactionId: string, authTransactionId: string, userId: string, expiresAt: Date) {
+  // Consume the WebAuthn challenge
+  await AuthChallengeModel.findByIdAndUpdate(transactionId, {
+    consumedAt: new Date(),
+    verifiedAt: new Date(),
+  });
+
+  // Create the COMPLETION challenge for /api/auth/complete to use
+  const completionToken = randomBytes(32).toString("base64url");
+  await AuthChallengeModel.create({
+    authTransactionId,
+    userId,
+    factor: "COMPLETION",
+    challengeHash: hashToken(completionToken),
+    expiresAt,
+    verifiedAt: new Date(),
+  });
+  return completionToken;
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
 
 export async function createRegistrationOptions(transactionToken: string) {
-  const found = await findWebAuthnTransaction(
-    transactionToken,
-    "WEBAUTHN_REGISTRATION",
-  );
-  if (!found) return { kind: "expired" as const };
-  const { admin, transaction } = found;
-  if (transaction.failed_attempts >= MAX_WEBAUTHN_ATTEMPTS) {
-    return { kind: "rate_limited" as const };
-  }
-  const [
-    { data: role, error: roleError },
-    { data: student, error: studentError },
-  ] = await Promise.all([
-    admin
-      .from("user_roles")
-      .select("role")
-      .eq("user_id", transaction.user_id)
-      .maybeSingle(),
-    admin
-      .from("students")
-      .select("id, registration_number")
-      .eq("auth_user_id", transaction.user_id)
-      .maybeSingle(),
+  const transaction = await findWebAuthnTransaction(transactionToken, "WEBAUTHN_REGISTRATION");
+  if (!transaction) return { kind: "expired" as const };
+  if (transaction.failedAttempts >= MAX_WEBAUTHN_ATTEMPTS) return { kind: "rate_limited" as const };
+
+  const [roleRecord, student] = await Promise.all([
+    UserRoleModel.findOne({ userId: transaction.userId }).lean(),
+    StudentModel.findOne({ authUserId: transaction.userId })
+      .select("_id registrationNumber")
+      .lean(),
   ]);
-  if (roleError || studentError) {
-    throw new WebAuthnServiceError("Could not load the account for passkey registration.");
-  }
-  if (!role || !["STUDENT", "ADMIN", "SUPER_ADMIN"].includes(role.role)) {
+  if (!roleRecord || !["STUDENT", "ADMIN", "SUPER_ADMIN"].includes(roleRecord.role)) {
     return { kind: "invalid" as const };
   }
-  if (role.role === "STUDENT" && !student) return { kind: "invalid" as const };
-  if (role.role !== "STUDENT" && student) {
-    throw new WebAuthnServiceError("The account role and student record do not match.");
-  }
+  if (roleRecord.role === "STUDENT" && !student) return { kind: "invalid" as const };
 
-  const [
-    { data: profile, error: profileError },
-    { data: existing, error: existingError },
-    { data: authUser, error: authUserError },
-  ] =
-    await Promise.all([
-      student
-        ? admin
-            .from("student_profiles")
-            .select("full_name")
-            .eq("student_id", student.id)
-            .maybeSingle()
-        : Promise.resolve({ data: null, error: null }),
-      admin
-        .from("webauthn_credentials")
-        .select("credential_id, transports")
-        .eq("user_id", transaction.user_id),
-      role.role === "STUDENT"
-        ? Promise.resolve({ data: null, error: null })
-        : admin.auth.admin.getUserById(transaction.user_id),
-    ]);
+  const [profile, existing, user] = await Promise.all([
+    student
+      ? StudentProfileModel.findOne({ studentId: student._id }).select("fullName").lean()
+      : null,
+    WebAuthnCredentialModel.find({ userId: transaction.userId })
+      .select("credentialId transports")
+      .lean(),
+    roleRecord.role !== "STUDENT"
+      ? UserModel.findById(transaction.userId).select("email").lean()
+      : null,
+  ]);
 
-  if (profileError || existingError || authUserError) {
-    throw new WebAuthnServiceError("Could not load the account for passkey registration.");
-  }
-  const userName = student?.registration_number ?? authUser?.user.email;
+  const userName = student?.registrationNumber ?? user?.email;
   if (!userName) return { kind: "invalid" as const };
 
   const { rpID } = getRelyingPartyConfig();
   const options = await generateRegistrationOptions({
     rpName: "St Jude University",
     rpID,
-    userID: new TextEncoder().encode(transaction.user_id),
+    userID: new TextEncoder().encode(transaction.userId.toString()),
     userName,
-    userDisplayName: profile?.full_name ?? userName,
+    userDisplayName: profile?.fullName ?? userName,
     attestationType: "none",
     timeout: 60_000,
     authenticatorSelection: {
@@ -219,39 +198,16 @@ export async function createRegistrationOptions(transactionToken: string) {
       userVerification: "required",
       authenticatorAttachment: "platform",
     },
-    excludeCredentials: (existing ?? []).map((credential) => ({
-      id: credential.credential_id,
-      transports: credential.transports,
+    excludeCredentials: existing.map((c) => ({
+      id: c.credentialId,
+      transports: c.transports as never,
     })),
   });
 
-  if (!(await saveChallenge(admin, transaction.id, options.challenge))) {
+  if (!(await saveChallenge(transaction._id.toString(), options.challenge))) {
     return { kind: "challenge_exists" as const };
   }
   return { kind: "options" as const, options };
-}
-
-async function consumeAndCreateCompletion(
-  admin: ReturnType<typeof getSupabaseAdminClient>,
-  transaction: {
-    id: string;
-  },
-) {
-  const completionToken = randomBytes(32).toString("base64url");
-  const { data: completed, error } = await admin.rpc(
-    "complete_webauthn_authentication",
-    {
-      _challenge_id: transaction.id,
-      _completion_token_hash: hashTransactionToken(completionToken),
-    },
-  );
-  if (error) {
-    throw new WebAuthnServiceError(
-      `Could not complete the WebAuthn transaction (database error ${error.code ?? "unknown"}).`,
-    );
-  }
-  if (completed !== true) return false;
-  return completionToken;
 }
 
 export async function verifyRegistration(
@@ -259,18 +215,14 @@ export async function verifyRegistration(
   responseValue: unknown,
   deviceName: string | undefined,
 ) {
-  const found = await findWebAuthnTransaction(
-    transactionToken,
-    "WEBAUTHN_REGISTRATION",
-  );
-  if (!found) return { kind: "expired" as const };
-  const { admin, transaction } = found;
-  if (!hasAttemptsRemaining(transaction.failed_attempts, MAX_WEBAUTHN_ATTEMPTS)) {
+  const transaction = await findWebAuthnTransaction(transactionToken, "WEBAUTHN_REGISTRATION");
+  if (!transaction) return { kind: "expired" as const };
+  if (!hasAttemptsRemaining(transaction.failedAttempts, MAX_WEBAUTHN_ATTEMPTS)) {
     return { kind: "rate_limited" as const };
   }
-  if (!transaction.webauthn_challenge) return { kind: "options_required" as const };
+  if (!transaction.webauthnChallenge) return { kind: "options_required" as const };
   if (!isRegistrationResponse(responseValue)) {
-    await recordFailedAttempt(admin, transaction);
+    await recordFailedAttempt(transaction._id.toString(), transaction.failedAttempts);
     return { kind: "invalid_response" as const };
   }
 
@@ -279,7 +231,7 @@ export async function verifyRegistration(
   try {
     verification = await verifyRegistrationResponse({
       response: responseValue,
-      expectedChallenge: transaction.webauthn_challenge,
+      expectedChallenge: transaction.webauthnChallenge,
       expectedOrigin: origin,
       expectedRPID: rpID,
       requireUserVerification: true,
@@ -287,120 +239,94 @@ export async function verifyRegistration(
   } catch (error) {
     if (!(error instanceof Error)) throw error;
     console.warn("WebAuthn registration response rejected:", error.name);
-    await recordFailedAttempt(admin, transaction);
+    await recordFailedAttempt(transaction._id.toString(), transaction.failedAttempts);
     return { kind: "verification_failed" as const };
   }
   if (!verification.verified || !verification.registrationInfo.userVerified) {
-    await recordFailedAttempt(admin, transaction);
+    await recordFailedAttempt(transaction._id.toString(), transaction.failedAttempts);
     return { kind: "verification_failed" as const };
   }
 
-  const { credential, credentialDeviceType, credentialBackedUp } =
-    verification.registrationInfo;
-  const { error: saveError } = await admin.from("webauthn_credentials").insert({
-    user_id: transaction.user_id,
-    credential_id: credential.id,
-    public_key: `\\x${Buffer.from(credential.publicKey).toString("hex")}`,
-    signature_counter: credential.counter,
-    transports: responseValue.response.transports ?? [],
-    device_name: deviceName ?? null,
-    backed_up: credentialBackedUp,
-  });
-  if (saveError) {
-    if (saveError.code === "23505") return { kind: "credential_exists" as const };
-    throw new WebAuthnServiceError("Could not store the registered passkey.");
-  }
+  const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+  const existing = await WebAuthnCredentialModel.findOne({ credentialId: credential.id });
+  if (existing) return { kind: "credential_exists" as const };
 
-  const completionToken = await consumeAndCreateCompletion(admin, transaction);
-  if (!completionToken) return { kind: "expired" as const };
-  return {
-    kind: "verified" as const,
-    completionToken,
-    credentialDeviceType,
-  };
+  await WebAuthnCredentialModel.create({
+    userId: transaction.userId,
+    credentialId: credential.id,
+    publicKey: Buffer.from(credential.publicKey),
+    signatureCounter: credential.counter,
+    transports: (responseValue as RegistrationResponseJSON).response.transports ?? [],
+    deviceName: deviceName ?? null,
+    backedUp: credentialBackedUp,
+  });
+
+  const completionToken = await consumeAndCreateCompletion(
+    transaction._id.toString(),
+    transaction.authTransactionId,
+    transaction.userId.toString(),
+    transaction.expiresAt,
+  );
+  return { kind: "verified" as const, completionToken, credentialDeviceType };
 }
 
 export async function createAuthenticationOptions(transactionToken: string) {
-  const found = await findWebAuthnTransaction(
-    transactionToken,
-    "WEBAUTHN_AUTHENTICATION",
-  );
-  if (!found) return { kind: "expired" as const };
-  const { admin, transaction } = found;
-  if (!hasAttemptsRemaining(transaction.failed_attempts, MAX_WEBAUTHN_ATTEMPTS)) {
+  const transaction = await findWebAuthnTransaction(transactionToken, "WEBAUTHN_AUTHENTICATION");
+  if (!transaction) return { kind: "expired" as const };
+  if (!hasAttemptsRemaining(transaction.failedAttempts, MAX_WEBAUTHN_ATTEMPTS)) {
     return { kind: "rate_limited" as const };
   }
-  const { data: credentials, error } = await admin
-    .from("webauthn_credentials")
-    .select("credential_id, transports")
-    .eq("user_id", transaction.user_id);
-  if (error) throw new WebAuthnServiceError("Could not load registered passkeys.");
-  if (!credentials?.length) return { kind: "credential_required" as const };
+
+  const credentials = await WebAuthnCredentialModel.find({ userId: transaction.userId })
+    .select("credentialId transports")
+    .lean();
+  if (!credentials.length) return { kind: "credential_required" as const };
 
   const { rpID } = getRelyingPartyConfig();
   const options = await generateAuthenticationOptions({
     rpID,
     timeout: 60_000,
     userVerification: "required",
-    allowCredentials: credentials.map((credential) => ({
-      id: credential.credential_id,
-      transports: credential.transports,
+    allowCredentials: credentials.map((c) => ({
+      id: c.credentialId,
+      transports: c.transports as never,
     })),
   });
-  if (!(await saveChallenge(admin, transaction.id, options.challenge))) {
+  if (!(await saveChallenge(transaction._id.toString(), options.challenge))) {
     return { kind: "challenge_exists" as const };
   }
   return { kind: "options" as const, options };
 }
 
-export async function verifyAuthentication(
-  transactionToken: string,
-  responseValue: unknown,
-) {
-  const found = await findWebAuthnTransaction(
-    transactionToken,
-    "WEBAUTHN_AUTHENTICATION",
-  );
-  if (!found) return { kind: "expired" as const };
-  const { admin, transaction } = found;
-  if (transaction.failed_attempts >= MAX_WEBAUTHN_ATTEMPTS) {
-    return { kind: "rate_limited" as const };
-  }
-  if (!transaction.webauthn_challenge) return { kind: "options_required" as const };
+export async function verifyAuthentication(transactionToken: string, responseValue: unknown) {
+  const transaction = await findWebAuthnTransaction(transactionToken, "WEBAUTHN_AUTHENTICATION");
+  if (!transaction) return { kind: "expired" as const };
+  if (transaction.failedAttempts >= MAX_WEBAUTHN_ATTEMPTS) return { kind: "rate_limited" as const };
+  if (!transaction.webauthnChallenge) return { kind: "options_required" as const };
   if (!isAuthenticationResponse(responseValue)) {
-    await recordFailedAttempt(admin, transaction);
+    await recordFailedAttempt(transaction._id.toString(), transaction.failedAttempts);
     return { kind: "invalid_response" as const };
   }
 
-  const { data: storedCredential, error } = await admin
-    .from("webauthn_credentials")
-    .select("id, credential_id, public_key, signature_counter, transports")
-    .eq("user_id", transaction.user_id)
-    .eq("credential_id", responseValue.id)
-    .maybeSingle();
-  if (error) throw new WebAuthnServiceError("Could not load the registered passkey.");
+  const storedCredential = await WebAuthnCredentialModel.findOne({
+    userId: transaction.userId,
+    credentialId: responseValue.id,
+  }).lean();
   if (!storedCredential) return { kind: "credential_not_found" as const };
-  if (
-    typeof storedCredential.public_key !== "string" ||
-    !storedCredential.public_key.startsWith("\\x")
-  ) {
-    throw new WebAuthnServiceError("Stored passkey public key has an invalid format.");
-  }
 
   const credential: WebAuthnCredential = {
-    id: storedCredential.credential_id,
-    publicKey: new Uint8Array(
-      Buffer.from(storedCredential.public_key.slice(2), "hex"),
-    ),
-    counter: Number(storedCredential.signature_counter),
-    transports: storedCredential.transports,
+    id: storedCredential.credentialId,
+    publicKey: new Uint8Array(storedCredential.publicKey),
+    counter: storedCredential.signatureCounter,
+    transports: storedCredential.transports as never,
   };
+
   const { rpID, origin } = getRelyingPartyConfig();
   let verification;
   try {
     verification = await verifyAuthenticationResponse({
       response: responseValue,
-      expectedChallenge: transaction.webauthn_challenge,
+      expectedChallenge: transaction.webauthnChallenge,
       expectedOrigin: origin,
       expectedRPID: rpID,
       credential,
@@ -409,30 +335,31 @@ export async function verifyAuthentication(
   } catch (error) {
     if (!(error instanceof Error)) throw error;
     console.warn("WebAuthn authentication response rejected:", error.name);
-    await recordFailedAttempt(admin, transaction);
+    await recordFailedAttempt(transaction._id.toString(), transaction.failedAttempts);
     return { kind: "verification_failed" as const };
   }
   if (!verification.verified || !verification.authenticationInfo.userVerified) {
-    await recordFailedAttempt(admin, transaction);
+    await recordFailedAttempt(transaction._id.toString(), transaction.failedAttempts);
     return { kind: "verification_failed" as const };
   }
 
-  const { data: updatedCredential, error: counterError } = await admin
-    .from("webauthn_credentials")
-    .update({
-      signature_counter: verification.authenticationInfo.newCounter,
-      backed_up: verification.authenticationInfo.credentialBackedUp,
-      last_used_at: new Date().toISOString(),
-    })
-    .eq("id", storedCredential.id)
-    .eq("signature_counter", storedCredential.signature_counter)
-    .select("id")
-    .maybeSingle();
-  if (counterError) throw new WebAuthnServiceError("Could not update the passkey counter.");
-  if (!updatedCredential) return { kind: "verification_failed" as const };
+  // Atomic counter update — if another request already incremented, bail
+  const updated = await WebAuthnCredentialModel.findOneAndUpdate(
+    { _id: storedCredential._id, signatureCounter: storedCredential.signatureCounter },
+    {
+      signatureCounter: verification.authenticationInfo.newCounter,
+      backedUp: verification.authenticationInfo.credentialBackedUp,
+      lastUsedAt: new Date(),
+    },
+  );
+  if (!updated) return { kind: "verification_failed" as const };
 
-  const completionToken = await consumeAndCreateCompletion(admin, transaction);
-  if (!completionToken) return { kind: "expired" as const };
+  const completionToken = await consumeAndCreateCompletion(
+    transaction._id.toString(),
+    transaction.authTransactionId,
+    transaction.userId.toString(),
+    transaction.expiresAt,
+  );
   return { kind: "verified" as const, completionToken };
 }
 

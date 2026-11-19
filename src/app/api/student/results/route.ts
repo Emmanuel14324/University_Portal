@@ -1,9 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
+import mongoose from "mongoose";
 import { authorizeApiRequest } from "@/lib/auth/api-authorization";
 import { apiUnavailable, getActiveStudentIdentity, StudentApiError } from "@/lib/api/students";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
 import { jsonError } from "@/lib/auth/http";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import {
+  CourseRegistrationModel,
+  ExaminationResultModel,
+  CourseModel,
+  SemesterModel,
+} from "@/lib/models";
 
 export async function GET(request: NextRequest) {
   const access = await authorizeApiRequest(request, ["STUDENT"]);
@@ -12,59 +18,62 @@ export async function GET(request: NextRequest) {
   try {
     const student = await getActiveStudentIdentity(access.session.id);
     if (!student) return jsonError("An active student account is required.", 403);
-    const admin = getSupabaseAdminClient();
-    const { data: registrations, error: registrationError } = await admin
-      .from("course_registrations")
-      .select("id, course_id, semester_id")
-      .eq("student_id", student.id);
-    if (registrationError) return apiUnavailable("Student result lookup failed.");
-    const registrationIds = (registrations ?? []).map((item) => item.id);
-    if (registrationIds.length === 0) {
+
+    await connectToDatabase();
+    const registrations = await CourseRegistrationModel.find({
+      studentId: new mongoose.Types.ObjectId(student.id),
+    })
+      .select("_id courseId semesterId")
+      .lean();
+
+    if (!registrations.length) {
       return NextResponse.json({ results: [] }, { headers: { "Cache-Control": "no-store" } });
     }
 
-    const { data: results, error: resultError } = await admin
-      .from("examination_results")
-      .select("course_registration_id, marks, grade, grade_points, published_at")
-      .eq("status", "PUBLISHED")
-      .in("course_registration_id", registrationIds)
-      .order("published_at", { ascending: false });
-    if (resultError) return apiUnavailable("Student result lookup failed.");
-    const published = results ?? [];
-    if (published.length === 0) {
+    const registrationIds = registrations.map((r) => r._id);
+    const results = await ExaminationResultModel.find({
+      courseRegistrationId: { $in: registrationIds },
+      status: "PUBLISHED",
+    })
+      .sort({ publishedAt: -1 })
+      .select("courseRegistrationId marks grade gradePoints publishedAt")
+      .lean();
+
+    if (!results.length) {
       return NextResponse.json({ results: [] }, { headers: { "Cache-Control": "no-store" } });
     }
 
-    const records = registrations ?? [];
-    const courseIds = [...new Set(records.map((item) => item.course_id))];
-    const semesterIds = [...new Set(records.map((item) => item.semester_id))];
-    const [{ data: courses, error: courseError }, { data: semesters, error: semesterError }] =
-      await Promise.all([
-        admin.from("courses").select("id, code, name, credit_units").in("id", courseIds),
-        admin.from("semesters").select("id, academic_year, name").in("id", semesterIds),
-      ]);
-    if (courseError || semesterError) return apiUnavailable("Student result details lookup failed.");
+    const courseIds = [...new Set(registrations.map((r) => r.courseId.toString()))];
+    const semesterIds = [...new Set(registrations.map((r) => r.semesterId.toString()))];
 
-    const registrationById = new Map(records.map((record) => [record.id, record]));
-    const courseById = new Map((courses ?? []).map((course) => [course.id, course]));
-    const semesterById = new Map((semesters ?? []).map((semester) => [semester.id, semester]));
+    const [courses, semesters] = await Promise.all([
+      CourseModel.find({ _id: { $in: courseIds } }).select("_id code name creditUnits").lean(),
+      SemesterModel.find({ _id: { $in: semesterIds } }).select("_id academicYear name").lean(),
+    ]);
+
+    const registrationById = new Map(registrations.map((r) => [r._id.toString(), r]));
+    const courseById = new Map(courses.map((c) => [c._id.toString(), c]));
+    const semesterById = new Map(semesters.map((s) => [s._id.toString(), s]));
+
     return NextResponse.json(
       {
-        results: published.map((result) => {
-          const registration = registrationById.get(result.course_registration_id);
+        results: results.map((result) => {
+          const reg = registrationById.get(result.courseRegistrationId.toString());
           return {
-            ...result,
-            course: registration ? courseById.get(registration.course_id) ?? null : null,
-            semester: registration ? semesterById.get(registration.semester_id) ?? null : null,
+            courseRegistrationId: result.courseRegistrationId.toString(),
+            marks: result.marks,
+            grade: result.grade,
+            gradePoints: result.gradePoints,
+            publishedAt: result.publishedAt,
+            course: reg ? (courseById.get(reg.courseId.toString()) ?? null) : null,
+            semester: reg ? (semesterById.get(reg.semesterId.toString()) ?? null) : null,
           };
         }),
       },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError || error instanceof StudentApiError) {
-      return apiUnavailable("Student result lookup failed.");
-    }
+    if (error instanceof StudentApiError) return apiUnavailable("Student result lookup failed.");
     throw error;
   }
 }

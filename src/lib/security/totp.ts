@@ -9,8 +9,13 @@ import {
 } from "node:crypto";
 import { generateSecret, generateURI, verify } from "otplib";
 import QRCode from "qrcode";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
+import {
+  AuthChallengeModel,
+  TotpCredentialModel,
+  WebAuthnCredentialModel,
+} from "@/lib/models";
 import {
   hasAttemptsRemaining,
   isTotpStepFresh,
@@ -35,18 +40,16 @@ type Factor =
   | "WEBAUTHN_REGISTRATION"
   | "WEBAUTHN_AUTHENTICATION";
 
+// ── Crypto helpers ──────────────────────────────────────────────────────────
+
 function getEncryptionKey() {
   const encoded = process.env.TOTP_ENCRYPTION_KEY;
   if (!encoded) {
-    throw new SupabaseConfigurationError(
-      "Set TOTP_ENCRYPTION_KEY to a base64-encoded 32-byte key.",
-    );
+    throw new MongoConfigurationError("Set TOTP_ENCRYPTION_KEY to a base64-encoded 32-byte key.");
   }
   const key = Buffer.from(encoded, "base64");
   if (key.length !== 32) {
-    throw new SupabaseConfigurationError(
-      "TOTP_ENCRYPTION_KEY must decode to exactly 32 bytes.",
-    );
+    throw new MongoConfigurationError("TOTP_ENCRYPTION_KEY must decode to exactly 32 bytes.");
   }
   return key;
 }
@@ -54,7 +57,7 @@ function getEncryptionKey() {
 function recoveryHash(code: string) {
   const key = process.env.TOTP_RECOVERY_HASH_KEY;
   if (!key || key.length < 32) {
-    throw new SupabaseConfigurationError(
+    throw new MongoConfigurationError(
       "Set TOTP_RECOVERY_HASH_KEY to a random secret of at least 32 characters.",
     );
   }
@@ -68,10 +71,7 @@ export function hashTransactionToken(token: string) {
 function encryptSecret(secret: string) {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", getEncryptionKey(), iv);
-  const encrypted = Buffer.concat([
-    cipher.update(secret, "utf8"),
-    cipher.final(),
-  ]);
+  const encrypted = Buffer.concat([cipher.update(secret, "utf8"), cipher.final()]);
   return `v1.${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${encrypted.toString("base64url")}`;
 }
 
@@ -92,144 +92,52 @@ function decryptSecret(value: string) {
   ]).toString("utf8");
 }
 
+// ── Transaction helpers ─────────────────────────────────────────────────────
+
 async function findActiveTransaction(token: string) {
-  const admin = getSupabaseAdminClient();
-  const { data: challenge, error } = await admin
-    .from("authentication_challenges")
-    .select("id, auth_transaction_id, user_id, factor, expires_at, failed_attempts")
-    .eq("challenge_hash", hashTransactionToken(token))
-    .in("factor", [
-      "PASSWORD_TRANSACTION",
-      "TOTP",
-      "WEBAUTHN_REGISTRATION",
-      "WEBAUTHN_AUTHENTICATION",
-    ])
-    .is("consumed_at", null)
-    .maybeSingle();
-  if (error) {
-    throw new TotpServiceError("Could not load the authentication transaction.");
-  }
+  await connectToDatabase();
+  const challenge = await AuthChallengeModel.findOne({
+    challengeHash: hashTransactionToken(token),
+    factor: { $in: ["PASSWORD_TRANSACTION", "TOTP", "WEBAUTHN_REGISTRATION", "WEBAUTHN_AUTHENTICATION"] },
+    consumedAt: null,
+  }).lean();
+
   if (
-    !challenge?.user_id ||
-    !Number.isFinite(new Date(challenge.expires_at).getTime()) ||
-    new Date(challenge.expires_at).getTime() <= Date.now()
+    !challenge?.userId ||
+    !Number.isFinite(new Date(challenge.expiresAt).getTime()) ||
+    new Date(challenge.expiresAt).getTime() <= Date.now()
   ) {
     return null;
   }
-  return { admin, challenge };
+  return challenge;
 }
 
 async function issueTransaction(
   userId: string,
   factor: Factor,
   transactionId = randomUUID(),
-  expiresAt?: string,
+  expiresAt?: Date,
 ) {
-  const admin = getSupabaseAdminClient();
   const token = randomBytes(32).toString("base64url");
-  const { error } = await admin.from("authentication_challenges").insert({
-    auth_transaction_id: transactionId,
-    user_id: userId,
+  await AuthChallengeModel.create({
+    authTransactionId: transactionId,
+    userId,
     factor,
-    challenge_hash: hashTransactionToken(token),
-    expires_at:
-      expiresAt ??
-      new Date(Date.now() + AUTH_TRANSACTION_TTL_SECONDS * 1000).toISOString(),
+    challengeHash: hashTransactionToken(token),
+    expiresAt: expiresAt ?? new Date(Date.now() + AUTH_TRANSACTION_TTL_SECONDS * 1000),
   });
-  if (error) {
-    throw new TotpServiceError("Could not create the next authentication transaction.");
-  }
   return token;
 }
 
-async function consumeChallenge(
-  admin: ReturnType<typeof getSupabaseAdminClient>,
-  id: string,
-  verified = true,
-) {
-  const { data, error } = await admin.rpc("consume_authentication_challenge", {
-    _challenge_id: id,
-    _verified: verified,
-  });
-  if (error) {
-    throw new TotpServiceError(
-      `Could not consume the authentication challenge (database error ${error.code ?? "unknown"}).`,
-    );
-  }
-  return data === true;
-}
-
-export async function beginTotpChallenge(transactionToken: string) {
-  const transaction = await findActiveTransaction(transactionToken);
-  if (!transaction) return { kind: "expired" as const };
-  const { admin, challenge } = transaction;
-  if (challenge.factor !== "PASSWORD_TRANSACTION") {
-    return { kind: "invalid" as const };
-  }
-
-  const { data: credential, error } = await admin
-    .from("totp_credentials")
-    .select("is_enabled")
-    .eq("user_id", challenge.user_id)
-    .maybeSingle();
-  if (error) throw new TotpServiceError("Could not check the authenticator state.");
-  if (!credential?.is_enabled) return { kind: "enrollment_required" as const };
-
-  const nextToken = await issueTransaction(
-    challenge.user_id,
-    "TOTP",
-    challenge.auth_transaction_id,
-    challenge.expires_at,
+async function consumeChallenge(id: string, verified = true) {
+  const result = await AuthChallengeModel.findOneAndUpdate(
+    { _id: id, consumedAt: null },
+    { consumedAt: new Date(), ...(verified ? { verifiedAt: new Date() } : {}) },
   );
-  if (!(await consumeChallenge(admin, challenge.id))) {
-    const { error: cleanupError } = await admin
-      .from("authentication_challenges")
-      .delete()
-      .eq("challenge_hash", hashTransactionToken(nextToken));
-    if (cleanupError) {
-      throw new TotpServiceError("Could not clean up an unused TOTP challenge.");
-    }
-    return { kind: "expired" as const };
-  }
-  return { kind: "challenge" as const, transactionToken: nextToken };
+  return result !== null;
 }
 
-export async function beginTotpEnrollment(transactionToken: string, label: string) {
-  const transaction = await findActiveTransaction(transactionToken);
-  if (!transaction) return { kind: "expired" as const };
-  const { admin, challenge } = transaction;
-  if (challenge.factor !== "PASSWORD_TRANSACTION") {
-    return { kind: "invalid" as const };
-  }
-
-  const { data: current, error: lookupError } = await admin
-    .from("totp_credentials")
-    .select("is_enabled")
-    .eq("user_id", challenge.user_id)
-    .maybeSingle();
-  if (lookupError) throw new TotpServiceError("Could not check authenticator enrollment.");
-  if (current?.is_enabled) return { kind: "already_enrolled" as const };
-
-  const secret = generateSecret({ length: 20 });
-  const uri = generateURI({ issuer: ISSUER, label, secret, digits: 6, period: PERIOD_SECONDS });
-  const qrDataUrl = await QRCode.toDataURL(uri, { errorCorrectionLevel: "M", margin: 2, width: 256 });
-  const { error: saveError } = await admin.from("totp_credentials").upsert(
-    {
-      user_id: challenge.user_id,
-      secret_ciphertext: encryptSecret(secret),
-      encryption_key_version: 1,
-      recovery_code_hashes: [],
-      is_enabled: false,
-      enabled_at: null,
-      enrollment_expires_at: challenge.expires_at,
-    },
-    { onConflict: "user_id" },
-  );
-  if (saveError) {
-    throw new TotpServiceError("Could not store the pending authenticator enrollment.");
-  }
-  return { kind: "ready" as const, qrDataUrl, manualEntryKey: secret };
-}
+// ── TOTP verification helper ────────────────────────────────────────────────
 
 async function checkTotp(token: string, secret: string, lastStep: number | null) {
   const currentStep = Math.floor(Date.now() / 1000 / PERIOD_SECONDS);
@@ -250,130 +158,162 @@ async function checkTotp(token: string, secret: string, lastStep: number | null)
   return { kind: "verified" as const, verifiedStep };
 }
 
-export async function verifyTotpEnrollment(transactionToken: string, token: string) {
-  const transaction = await findActiveTransaction(transactionToken);
-  if (!transaction) return { kind: "expired" as const };
-  const { admin, challenge } = transaction;
-  if (challenge.factor !== "PASSWORD_TRANSACTION") {
-    return { kind: "invalid" as const };
+// ── Public API ──────────────────────────────────────────────────────────────
+
+export async function beginTotpChallenge(transactionToken: string) {
+  const challenge = await findActiveTransaction(transactionToken);
+  if (!challenge) return { kind: "expired" as const };
+  if (challenge.factor !== "PASSWORD_TRANSACTION") return { kind: "invalid" as const };
+
+  const credential = await TotpCredentialModel.findOne({
+    userId: challenge.userId,
+  }).lean();
+  if (!credential?.isEnabled) return { kind: "enrollment_required" as const };
+
+  const nextToken = await issueTransaction(
+    challenge.userId.toString(),
+    "TOTP",
+    challenge.authTransactionId,
+    challenge.expiresAt,
+  );
+  if (!(await consumeChallenge(challenge._id.toString()))) {
+    await AuthChallengeModel.deleteOne({ challengeHash: hashTransactionToken(nextToken) });
+    return { kind: "expired" as const };
   }
-  if (!hasAttemptsRemaining(challenge.failed_attempts, MAX_ATTEMPTS)) {
+  return { kind: "challenge" as const, transactionToken: nextToken };
+}
+
+export async function beginTotpEnrollment(transactionToken: string, label: string) {
+  const challenge = await findActiveTransaction(transactionToken);
+  if (!challenge) return { kind: "expired" as const };
+  if (challenge.factor !== "PASSWORD_TRANSACTION") return { kind: "invalid" as const };
+
+  const current = await TotpCredentialModel.findOne({ userId: challenge.userId }).lean();
+  if (current?.isEnabled) return { kind: "already_enrolled" as const };
+
+  const secret = generateSecret({ length: 20 });
+  const uri = generateURI({ issuer: ISSUER, label, secret, digits: 6, period: PERIOD_SECONDS });
+  const qrDataUrl = await QRCode.toDataURL(uri, { errorCorrectionLevel: "M", margin: 2, width: 256 });
+
+  await TotpCredentialModel.findOneAndUpdate(
+    { userId: challenge.userId },
+    {
+      userId: challenge.userId,
+      secretCiphertext: encryptSecret(secret),
+      encryptionKeyVersion: 1,
+      recoveryCodeHashes: [],
+      isEnabled: false,
+      enabledAt: null,
+      enrollmentExpiresAt: challenge.expiresAt,
+    },
+    { upsert: true },
+  );
+
+  return { kind: "ready" as const, qrDataUrl, manualEntryKey: secret };
+}
+
+export async function verifyTotpEnrollment(transactionToken: string, token: string) {
+  const challenge = await findActiveTransaction(transactionToken);
+  if (!challenge) return { kind: "expired" as const };
+  if (challenge.factor !== "PASSWORD_TRANSACTION") return { kind: "invalid" as const };
+  if (!hasAttemptsRemaining(challenge.failedAttempts, MAX_ATTEMPTS)) {
     return { kind: "rate_limited" as const };
   }
 
-  const { data: credential, error } = await admin
-    .from("totp_credentials")
-    .select("secret_ciphertext, is_enabled, enrollment_expires_at")
-    .eq("user_id", challenge.user_id)
-    .maybeSingle();
-  if (error) throw new TotpServiceError("Could not load the pending authenticator.");
+  const credential = await TotpCredentialModel.findOne({ userId: challenge.userId }).lean();
   if (
     !credential ||
-    credential.is_enabled ||
-    !credential.enrollment_expires_at ||
-    new Date(credential.enrollment_expires_at).getTime() <= Date.now()
+    credential.isEnabled ||
+    !credential.enrollmentExpiresAt ||
+    new Date(credential.enrollmentExpiresAt).getTime() <= Date.now()
   ) {
     return { kind: "invalid" as const };
   }
 
-  const checked = await checkTotp(token, decryptSecret(credential.secret_ciphertext), null);
+  const checked = await checkTotp(token, decryptSecret(credential.secretCiphertext), null);
   if (checked.kind !== "verified") {
-    const { error: attemptError } = await admin
-      .from("authentication_challenges")
-      .update({ failed_attempts: challenge.failed_attempts + 1 })
-      .eq("id", challenge.id)
-      .is("consumed_at", null);
-    if (attemptError) throw new TotpServiceError("Could not record an enrollment attempt.");
+    await AuthChallengeModel.findByIdAndUpdate(challenge._id, {
+      $inc: { failedAttempts: 1 },
+    });
     return checked;
   }
 
+  // Generate recovery codes
   const recoveryCodes = Array.from({ length: 10 }, () =>
     randomBytes(9).toString("base64url").toUpperCase(),
   );
-  const nextToken = randomBytes(32).toString("base64url");
-  const { data: completed, error: completionError } = await admin.rpc(
-    "complete_totp_enrollment",
+
+  // Enable TOTP credential
+  await TotpCredentialModel.findOneAndUpdate(
+    { userId: challenge.userId },
     {
-      _password_challenge_id: challenge.id,
-      _verified_step: checked.verifiedStep,
-      _recovery_code_hashes: recoveryCodes.map(recoveryHash),
-      _totp_marker_hash: hashTransactionToken(randomBytes(32).toString("base64url")),
-      _webauthn_transaction_hash: hashTransactionToken(nextToken),
+      isEnabled: true,
+      enabledAt: new Date(),
+      recoveryCodeHashes: recoveryCodes.map(recoveryHash),
+      lastVerifiedStep: checked.verifiedStep,
     },
   );
-  if (completionError) {
-    throw new TotpServiceError(
-      `Could not complete authenticator enrollment (database error ${completionError.code ?? "unknown"}).`,
-    );
-  }
-  if (completed !== true) return { kind: "expired" as const };
+
+  // Consume this challenge and issue the WebAuthn transaction
+  await consumeChallenge(challenge._id.toString());
+  const nextToken = await issueTransaction(
+    challenge.userId.toString(),
+    "WEBAUTHN_REGISTRATION",
+    challenge.authTransactionId,
+    challenge.expiresAt,
+  );
+
   return { kind: "verified" as const, recoveryCodes, transactionToken: nextToken };
 }
 
 export async function verifyTotpChallenge(transactionToken: string, token: string) {
-  const transaction = await findActiveTransaction(transactionToken);
-  if (!transaction) return { kind: "expired" as const };
-  const { admin, challenge } = transaction;
+  const challenge = await findActiveTransaction(transactionToken);
+  if (!challenge) return { kind: "expired" as const };
   if (challenge.factor !== "TOTP") return { kind: "invalid" as const };
-  if (!hasAttemptsRemaining(challenge.failed_attempts, MAX_ATTEMPTS)) {
+  if (!hasAttemptsRemaining(challenge.failedAttempts, MAX_ATTEMPTS)) {
     return { kind: "rate_limited" as const };
   }
 
-  const { data: credential, error } = await admin
-    .from("totp_credentials")
-    .select("secret_ciphertext, is_enabled, last_verified_step")
-    .eq("user_id", challenge.user_id)
-    .maybeSingle();
-  if (error) throw new TotpServiceError("Could not load the authenticator credential.");
-  if (!credential?.is_enabled) return { kind: "invalid" as const };
+  const credential = await TotpCredentialModel.findOne({ userId: challenge.userId }).lean();
+  if (!credential?.isEnabled) return { kind: "invalid" as const };
 
   const checked = await checkTotp(
     token,
-    decryptSecret(credential.secret_ciphertext),
-    credential.last_verified_step,
+    decryptSecret(credential.secretCiphertext),
+    credential.lastVerifiedStep ?? null,
   );
   if (checked.kind !== "verified") {
     if (checked.kind === "invalid") {
-      const { error: attemptError } = await admin
-        .from("authentication_challenges")
-        .update({ failed_attempts: challenge.failed_attempts + 1 })
-        .eq("id", challenge.id)
-        .is("consumed_at", null);
-      if (attemptError) throw new TotpServiceError("Could not record a TOTP attempt.");
+      await AuthChallengeModel.findByIdAndUpdate(challenge._id, {
+        $inc: { failedAttempts: 1 },
+      });
     }
     return checked;
   }
 
-  let update = admin
-    .from("totp_credentials")
-    .update({ last_verified_step: checked.verifiedStep })
-    .eq("user_id", challenge.user_id);
-  update =
-    credential.last_verified_step === null
-      ? update.is("last_verified_step", null)
-      : update.eq("last_verified_step", credential.last_verified_step);
-  const { data: updated, error: updateError } = await update
-    .select("user_id")
-    .maybeSingle();
-  if (updateError) throw new TotpServiceError("Could not apply TOTP replay protection.");
+  // Atomic replay protection — only update if lastVerifiedStep hasn't moved
+  const filter =
+    credential.lastVerifiedStep === null
+      ? { userId: challenge.userId, lastVerifiedStep: null }
+      : { userId: challenge.userId, lastVerifiedStep: credential.lastVerifiedStep };
+
+  const updated = await TotpCredentialModel.findOneAndUpdate(filter, {
+    lastVerifiedStep: checked.verifiedStep,
+  });
   if (!updated) return { kind: "replayed" as const };
-  if (!(await consumeChallenge(admin, challenge.id))) {
+  if (!(await consumeChallenge(challenge._id.toString()))) {
     return { kind: "replayed" as const };
   }
 
-  const { count, error: credentialError } = await admin
-    .from("webauthn_credentials")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", challenge.user_id);
-  if (credentialError) {
-    throw new TotpServiceError("Could not check the account passkey state.");
-  }
-  const nextFactor = nextWebAuthnFactor(count ?? 0);
+  const credentialCount = await WebAuthnCredentialModel.countDocuments({
+    userId: challenge.userId,
+  });
+  const nextFactor = nextWebAuthnFactor(credentialCount);
   const nextToken = await issueTransaction(
-    challenge.user_id,
+    challenge.userId.toString(),
     nextFactor,
-    challenge.auth_transaction_id,
-    challenge.expires_at,
+    challenge.authTransactionId,
+    challenge.expiresAt,
   );
   return { kind: "verified" as const, nextFactor, transactionToken: nextToken };
 }
@@ -382,53 +322,46 @@ export async function verifyTotpRecoveryCode(
   transactionToken: string,
   recoveryCode: string,
 ) {
-  const transaction = await findActiveTransaction(transactionToken);
-  if (!transaction) return { kind: "expired" as const };
-  const { admin, challenge } = transaction;
+  const challenge = await findActiveTransaction(transactionToken);
+  if (!challenge) return { kind: "expired" as const };
   if (challenge.factor !== "TOTP") return { kind: "invalid" as const };
-  if (!hasAttemptsRemaining(challenge.failed_attempts, MAX_ATTEMPTS)) {
+  if (!hasAttemptsRemaining(challenge.failedAttempts, MAX_ATTEMPTS)) {
     return { kind: "rate_limited" as const };
   }
 
-  const nextToken = randomBytes(32).toString("base64url");
-  const { data, error } = await admin.rpc("consume_totp_recovery_code", {
-    _challenge_id: challenge.id,
-    _code_hash: recoveryHash(recoveryCode),
-    _next_transaction_hash: hashTransactionToken(nextToken),
+  const codeHash = recoveryHash(recoveryCode);
+  const credential = await TotpCredentialModel.findOne({
+    userId: challenge.userId,
+    recoveryCodeHashes: codeHash,
   });
-  if (error) {
-    throw new TotpServiceError(
-      `Could not verify the recovery code (database error ${error.code ?? "unknown"}).`,
-    );
-  }
-
-  const result = data?.[0];
-  if (!result || result.outcome === "invalid") {
+  if (!credential) {
+    await AuthChallengeModel.findByIdAndUpdate(challenge._id, {
+      $inc: { failedAttempts: 1 },
+    });
     return { kind: "invalid" as const };
   }
-  if (result.outcome === "expired") return { kind: "expired" as const };
-  if (result.outcome === "rate_limited") return { kind: "rate_limited" as const };
-  if (result.outcome !== "verified") {
-    throw new TotpServiceError("Recovery code verification returned an invalid state.");
-  }
-  if (
-    result.next_factor !== "WEBAUTHN_REGISTRATION" &&
-    result.next_factor !== "WEBAUTHN_AUTHENTICATION"
-  ) {
-    throw new TotpServiceError("Recovery code verification returned an invalid next factor.");
-  }
 
-  return {
-    kind: "verified" as const,
-    nextFactor: result.next_factor,
-    transactionToken: nextToken,
-  };
+  // Consume the recovery code
+  await TotpCredentialModel.findByIdAndUpdate(credential._id, {
+    $pull: { recoveryCodeHashes: codeHash },
+  });
+  await consumeChallenge(challenge._id.toString());
+
+  const credentialCount = await WebAuthnCredentialModel.countDocuments({
+    userId: challenge.userId,
+  });
+  const nextFactor = nextWebAuthnFactor(credentialCount);
+  const nextToken = await issueTransaction(
+    challenge.userId.toString(),
+    nextFactor,
+    challenge.authTransactionId,
+    challenge.expiresAt,
+  );
+  return { kind: "verified" as const, nextFactor, transactionToken: nextToken };
 }
 
 export function getTotpTransactionCookieName() {
-  return process.env.NODE_ENV === "production"
-    ? "__Host-stj-auth-tx"
-    : "stj-auth-tx";
+  return process.env.NODE_ENV === "production" ? "__Host-stj-auth-tx" : "stj-auth-tx";
 }
 
 export function getTotpCookieSettings() {

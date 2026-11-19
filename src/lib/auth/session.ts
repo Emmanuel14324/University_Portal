@@ -1,23 +1,25 @@
 import "server-only";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { cookies } from "next/headers";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { hashTransactionToken } from "@/lib/security/totp";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import {
+  UserSessionModel,
+  UserRoleModel,
+  StudentModel,
+  AuthChallengeModel,
+} from "@/lib/models";
 import { isAppSessionActive } from "@/lib/auth/policies";
+import type { AppRole } from "@/lib/models/UserRole";
+
+export type { AppRole };
 
 export const APP_SESSION_TTL_SECONDS = 8 * 60 * 60;
-
-export type AppRole = "STUDENT" | "ADMIN" | "SUPER_ADMIN";
 
 export type AppSession = {
   id: string;
   role: AppRole;
   expiresAt: string;
 };
-
-function isAppRole(value: unknown): value is AppRole {
-  return value === "STUDENT" || value === "ADMIN" || value === "SUPER_ADMIN";
-}
 
 export class AppSessionError extends Error {
   constructor(message: string) {
@@ -27,9 +29,7 @@ export class AppSessionError extends Error {
 }
 
 export function getAppSessionCookieName() {
-  return process.env.NODE_ENV === "production"
-    ? "__Host-stj-session"
-    : "stj-session";
+  return process.env.NODE_ENV === "production" ? "__Host-stj-session" : "stj-session";
 }
 
 export function getAppSessionCookieSettings() {
@@ -42,112 +42,140 @@ export function getAppSessionCookieSettings() {
   };
 }
 
-export async function createAppSession(completionToken: string) {
-  const sessionToken = randomBytes(32).toString("base64url");
-  const expiresAt = new Date(Date.now() + APP_SESSION_TTL_SECONDS * 1000).toISOString();
-  const admin = getSupabaseAdminClient();
-  const { data, error } = await admin.rpc("create_authenticated_session", {
-    _completion_token_hash: hashTransactionToken(completionToken),
-    _session_token_hash: hashTransactionToken(sessionToken),
-    _expires_at: expiresAt,
-  });
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
 
-  if (error) {
-    throw new AppSessionError("Could not create the authenticated application session.");
-  }
-  const created = data?.[0];
+function isAppRole(value: unknown): value is AppRole {
+  return value === "STUDENT" || value === "ADMIN" || value === "SUPER_ADMIN";
+}
+
+/**
+ * Called after all 3 auth factors pass. Verifies the COMPLETION challenge
+ * exists (written by the WebAuthn step), then issues a session.
+ */
+export async function createAppSession(completionToken: string) {
+  await connectToDatabase();
+
+  const tokenHash = hashToken(completionToken);
+
+  // Find the COMPLETION challenge written by the WebAuthn step
+  const challenge = await AuthChallengeModel.findOne({
+    challengeHash: tokenHash,
+    factor: "COMPLETION",
+    consumedAt: null,
+  }).lean();
+
   if (
-    !created ||
-    typeof created.session_id !== "string" ||
-    typeof created.user_id !== "string" ||
-    !isAppRole(created.role)
+    !challenge ||
+    !challenge.userId ||
+    new Date(challenge.expiresAt).getTime() <= Date.now()
   ) {
     return { kind: "invalid" as const };
   }
 
+  // Check all 3 factors exist in the same transaction and are verified
+  const factors = await AuthChallengeModel.find({
+    authTransactionId: challenge.authTransactionId,
+    consumedAt: { $ne: null },
+    verifiedAt: { $ne: null },
+  })
+    .select("factor verifiedAt consumedAt")
+    .lean();
+
+  const hasPassword = factors.some((f) => f.factor === "PASSWORD_TRANSACTION");
+  const hasTotp = factors.some((f) => f.factor === "TOTP");
+  const hasWebAuthn = factors.some(
+    (f) =>
+      f.factor === "WEBAUTHN_REGISTRATION" || f.factor === "WEBAUTHN_AUTHENTICATION",
+  );
+
+  if (!hasPassword || !hasTotp || !hasWebAuthn) {
+    return { kind: "invalid" as const };
+  }
+
+  // Get role
+  const roleRecord = await UserRoleModel.findOne({ userId: challenge.userId }).lean();
+  if (!roleRecord || !isAppRole(roleRecord.role)) {
+    return { kind: "invalid" as const };
+  }
+
+  // Consume the COMPLETION challenge
+  await AuthChallengeModel.findByIdAndUpdate(challenge._id, { consumedAt: new Date() });
+
+  // Create session
+  const sessionToken = randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + APP_SESSION_TTL_SECONDS * 1000);
+
+  await UserSessionModel.create({
+    userId: challenge.userId,
+    sessionTokenHash: hashToken(sessionToken),
+    expiresAt,
+    lastSeenAt: new Date(),
+  });
+
   return {
     kind: "created" as const,
     sessionToken,
-    userId: created.user_id,
-    role: created.role,
-    expiresAt,
+    userId: challenge.userId.toString(),
+    role: roleRecord.role,
+    expiresAt: expiresAt.toISOString(),
   };
 }
 
-export async function getAppSession(sessionToken: string | undefined) {
-  if (!sessionToken || sessionToken.length < 32 || sessionToken.length > 128) {
-    return null;
-  }
+export async function getAppSession(sessionToken: string | undefined): Promise<AppSession | null> {
+  if (!sessionToken || sessionToken.length < 32 || sessionToken.length > 128) return null;
 
-  const admin = getSupabaseAdminClient();
-  const now = new Date().toISOString();
-  const tokenHash = hashTransactionToken(sessionToken);
-  const { data: session, error: sessionError } = await admin
-    .from("user_sessions")
-    .select("id, user_id, expires_at, last_seen_at")
-    .eq("session_token_hash", tokenHash)
-    .is("revoked_at", null)
-    .gt("expires_at", now)
-    .maybeSingle();
+  await connectToDatabase();
+  const now = new Date();
+  const tokenHash = hashToken(sessionToken);
 
-  if (sessionError) throw new AppSessionError("Could not validate the application session.");
-  if (!session || !isAppSessionActive(session.expires_at, null)) return null;
+  const session = await UserSessionModel.findOne({
+    sessionTokenHash: tokenHash,
+    revokedAt: null,
+    expiresAt: { $gt: now },
+  }).lean();
 
-  const { data: roleRecord, error: roleError } = await admin
-    .from("user_roles")
-    .select("role")
-    .eq("user_id", session.user_id)
-    .maybeSingle();
-  if (roleError) throw new AppSessionError("Could not load the application role.");
-  const role = roleRecord?.role;
-  if (!isAppRole(role)) {
-    return null;
-  }
+  if (!session || !isAppSessionActive(session.expiresAt.toISOString(), null)) return null;
 
-  if (role === "STUDENT") {
-    const { data: student, error: studentError } = await admin
-      .from("students")
+  const roleRecord = await UserRoleModel.findOne({ userId: session.userId }).lean();
+  if (!roleRecord || !isAppRole(roleRecord.role)) return null;
+
+  // Students must be ACTIVE
+  if (roleRecord.role === "STUDENT") {
+    const student = await StudentModel.findOne({ authUserId: session.userId })
       .select("status")
-      .eq("auth_user_id", session.user_id)
-      .maybeSingle();
-    if (studentError) throw new AppSessionError("Could not validate student account status.");
+      .lean();
     if (student?.status !== "ACTIVE") {
       await revokeAppSession(sessionToken);
       return null;
     }
   }
 
-  if (Date.now() - new Date(session.last_seen_at).getTime() >= 5 * 60 * 1000) {
-    const { error: activityError } = await admin
-      .from("user_sessions")
-      .update({ last_seen_at: now })
-      .eq("id", session.id)
-      .is("revoked_at", null)
-      .gt("expires_at", now);
-    if (activityError) throw new AppSessionError("Could not update session activity.");
+  // Bump last_seen_at if stale > 5 min
+  if (Date.now() - session.lastSeenAt.getTime() >= 5 * 60 * 1000) {
+    await UserSessionModel.findByIdAndUpdate(session._id, { lastSeenAt: now });
   }
 
   return {
-    id: session.user_id,
-    role,
-    expiresAt: session.expires_at,
-  } satisfies AppSession;
+    id: session.userId.toString(),
+    role: roleRecord.role,
+    expiresAt: session.expiresAt.toISOString(),
+  };
 }
 
-export async function getCurrentAppSession() {
+export async function getCurrentAppSession(): Promise<AppSession | null> {
   const cookieStore = await cookies();
   return getAppSession(cookieStore.get(getAppSessionCookieName())?.value);
 }
 
-export async function revokeAppSession(sessionToken: string | undefined) {
-  if (!sessionToken || sessionToken.length < 32 || sessionToken.length > 128) {
-    return false;
-  }
+export async function revokeAppSession(sessionToken: string | undefined): Promise<boolean> {
+  if (!sessionToken || sessionToken.length < 32 || sessionToken.length > 128) return false;
 
-  const admin = getSupabaseAdminClient();
-  const { data, error } = await admin.rpc("revoke_authenticated_session", {
-    _session_token_hash: hashTransactionToken(sessionToken),
-  });
-  if (error) throw new AppSessionError("Could not revoke the application session.");
-  return data?.[0]?.revoked === true;
+  await connectToDatabase();
+  const result = await UserSessionModel.findOneAndUpdate(
+    { sessionTokenHash: hashToken(sessionToken), revokedAt: null },
+    { revokedAt: new Date() },
+  );
+  return result !== null;
 }

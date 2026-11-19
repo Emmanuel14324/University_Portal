@@ -1,13 +1,14 @@
-import { createHash } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 import { isSameOriginRequest, jsonError } from "@/lib/auth/http";
 import {
   beginTotpEnrollment,
   getTotpTransactionCookieName,
   TotpServiceError,
+  hashTransactionToken,
 } from "@/lib/security/totp";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import { AuthChallengeModel, StudentModel } from "@/lib/models";
 
 export async function POST(request: NextRequest) {
   if (!isSameOriginRequest(request)) {
@@ -17,34 +18,28 @@ export async function POST(request: NextRequest) {
   if (!token) return jsonError("Password authentication is required.", 401);
 
   try {
-    const admin = getSupabaseAdminClient();
-    const { data: challenge, error: challengeError } = await admin
-      .from("authentication_challenges")
-      .select("user_id, expires_at")
-      .eq("challenge_hash", createHash("sha256").update(token).digest("hex"))
-      .eq("factor", "PASSWORD_TRANSACTION")
-      .is("consumed_at", null)
-      .maybeSingle();
-    if (challengeError) {
-      throw new TotpServiceError("Could not validate the enrollment transaction.");
-    }
-    if (!challenge?.user_id || new Date(challenge.expires_at).getTime() <= Date.now()) {
+    await connectToDatabase();
+    const challenge = await AuthChallengeModel.findOne({
+      challengeHash: hashTransactionToken(token),
+      factor: "PASSWORD_TRANSACTION",
+      consumedAt: null,
+    }).lean();
+
+    if (!challenge?.userId || new Date(challenge.expiresAt).getTime() <= Date.now()) {
       const response = jsonError("The authentication transaction expired.", 401);
       response.cookies.delete(getTotpTransactionCookieName());
       return response;
     }
 
-    const { data: student, error: studentError } = await admin
-      .from("students")
-      .select("registration_number")
-      .eq("auth_user_id", challenge.user_id)
-      .maybeSingle();
-    if (studentError) throw new TotpServiceError("Could not load student enrollment identity.");
+    const student = await StudentModel.findOne({ authUserId: challenge.userId })
+      .select("registrationNumber")
+      .lean();
 
     const result = await beginTotpEnrollment(
       token,
-      student?.registration_number ?? "university-account",
+      student?.registrationNumber ?? "university-account",
     );
+
     if (result.kind === "expired") {
       const response = jsonError("The authentication transaction expired.", 401);
       response.cookies.delete(getTotpTransactionCookieName());
@@ -62,7 +57,7 @@ export async function POST(request: NextRequest) {
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) {
+    if (error instanceof MongoConfigurationError) {
       return jsonError("Authentication service is not configured.", 503);
     }
     if (error instanceof TotpServiceError) {

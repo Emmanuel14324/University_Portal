@@ -8,7 +8,7 @@ import {
   verifyRegistration,
   WebAuthnServiceError,
 } from "@/lib/security/webauthn";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
 import { webauthnRegistrationSchema } from "@/lib/validation/auth";
 
 export async function POST(request: NextRequest) {
@@ -60,7 +60,7 @@ export async function POST(request: NextRequest) {
     response.cookies.set(cookieName, result.completionToken, getTotpCookieSettings());
     return response;
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) {
+    if (error instanceof MongoConfigurationError) {
       return jsonError("WebAuthn service is not configured.", 503);
     }
     if (error instanceof WebAuthnServiceError) {

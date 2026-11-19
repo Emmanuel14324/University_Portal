@@ -1,16 +1,21 @@
 import "server-only";
 import { createHmac, createHash, randomBytes, randomUUID } from "node:crypto";
-import { createClient } from "@supabase/supabase-js";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { AUTH_TRANSACTION_TTL_SECONDS } from "@/lib/auth/transaction";
+import bcrypt from "bcryptjs";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
 import {
-  getSupabaseConfig,
-  SupabaseConfigurationError,
-} from "@/lib/supabase/config";
+  UserModel,
+  StudentModel,
+  UserRoleModel,
+  AuthRateLimitModel,
+  LoginAttemptModel,
+  AuthChallengeModel,
+} from "@/lib/models";
+import { AUTH_TRANSACTION_TTL_SECONDS } from "@/lib/auth/transaction";
 
 const LOCKOUT_THRESHOLD = 5;
-const LOCKOUT_WINDOW_SECONDS = 15 * 60;
-const LOCKOUT_SECONDS = 15 * 60;
+const LOCKOUT_WINDOW_MS = 15 * 60 * 1000;
+const LOCKOUT_MS = 15 * 60 * 1000;
 
 export class PasswordLoginUnavailableError extends Error {
   constructor(message: string) {
@@ -26,13 +31,11 @@ export type PasswordLoginResult =
 
 function getIdentifierHash(identifier: string): string {
   const secret = process.env.AUTH_RATE_LIMIT_SECRET;
-
   if (!secret || secret.length < 32) {
-    throw new SupabaseConfigurationError(
+    throw new MongoConfigurationError(
       "Set AUTH_RATE_LIMIT_SECRET to a random value of at least 32 characters.",
     );
   }
-
   return createHmac("sha256", secret).update(identifier).digest("hex");
 }
 
@@ -44,229 +47,150 @@ function isEmail(identifier: string): boolean {
   return identifier.includes("@");
 }
 
-async function recordFailedAttempt(
-  admin: ReturnType<typeof getSupabaseAdminClient>,
-  identifierHash: string,
-  userId: string | null,
-) {
-  const { error: rateLimitError } = await admin.rpc("record_password_failure", {
-    _identifier_hash: identifierHash,
-    _max_failures: LOCKOUT_THRESHOLD,
-    _window_seconds: LOCKOUT_WINDOW_SECONDS,
-    _lock_seconds: LOCKOUT_SECONDS,
-  });
+async function recordFailedAttempt(identifierHash: string, userId: string | null) {
+  const now = new Date();
 
-  if (rateLimitError) {
-    throw new PasswordLoginUnavailableError(
-      "Could not update password-login rate limits.",
-    );
+  // Load or create the rate-limit record in application code — avoids
+  // aggregation pipeline upsert bugs on first-time documents.
+  const existing = await AuthRateLimitModel.findOne({ identifierHash });
+
+  if (!existing) {
+    // First failure — create a fresh record
+    await AuthRateLimitModel.create({
+      identifierHash,
+      failureCount: 1,
+      windowStartsAt: now,
+      lockedUntil: null,
+    });
+  } else {
+    const windowExpired = now.getTime() - existing.windowStartsAt.getTime() >= LOCKOUT_WINDOW_MS;
+    const newCount = windowExpired ? 1 : existing.failureCount + 1;
+    const lockedUntil = newCount >= LOCKOUT_THRESHOLD ? new Date(now.getTime() + LOCKOUT_MS) : null;
+
+    await AuthRateLimitModel.findByIdAndUpdate(existing._id, {
+      failureCount: newCount,
+      windowStartsAt: windowExpired ? now : existing.windowStartsAt,
+      lockedUntil,
+    });
   }
 
-  const { error: attemptError } = await admin.from("login_attempts").insert({
-    user_id: userId,
-    identifier_hash: identifierHash,
+  await LoginAttemptModel.create({
+    userId: userId ?? null,
+    identifierHash,
     factor: "PASSWORD_TRANSACTION",
     succeeded: false,
   });
-
-  if (attemptError) {
-    throw new PasswordLoginUnavailableError(
-      "Could not record the password-login attempt.",
-    );
-  }
 }
 
 export async function beginPasswordLogin(
   rawIdentifier: string,
   password: string,
 ): Promise<PasswordLoginResult> {
+  await connectToDatabase();
+
   const identifier = isEmail(rawIdentifier)
     ? rawIdentifier.trim().toLowerCase()
     : rawIdentifier.trim().toUpperCase();
-  const isRegistrationNumberLogin = !isEmail(identifier);
+
   const identifierHash = getIdentifierHash(identifier);
-  const admin = getSupabaseAdminClient();
 
-  const { data: limitRecord, error: limitError } = await admin
-    .from("auth_rate_limits")
-    .select("locked_until")
-    .eq("identifier_hash", identifierHash)
-    .maybeSingle();
-
-  if (limitError) {
-    throw new PasswordLoginUnavailableError(
-      "Could not check password-login rate limits.",
-    );
-  }
-
-  if (limitRecord?.locked_until) {
-    const remaining = Math.ceil(
-      (new Date(limitRecord.locked_until).getTime() - Date.now()) / 1000,
-    );
+  // Check rate limit
+  const limitRecord = await AuthRateLimitModel.findOne({ identifierHash }).lean();
+  if (limitRecord?.lockedUntil) {
+    const remaining = Math.ceil((limitRecord.lockedUntil.getTime() - Date.now()) / 1000);
     if (remaining > 0) {
       return { kind: "rate_limited", retryAfter: remaining };
     }
   }
 
-  let email = isEmail(identifier) ? identifier : null;
+  // Resolve user
+  let user: { _id: string; email: string; passwordHash: string } | null = null;
   let studentStatus: string | null = null;
   let userId: string | null = null;
 
-  if (!email) {
-    const { data: student, error: studentError } = await admin
-      .from("students")
-      .select("auth_user_id, status")
-      .eq("registration_number", identifier)
-      .maybeSingle();
-
-    if (studentError) {
-      throw new PasswordLoginUnavailableError(
-        "Could not look up the university registration number.",
-      );
+  if (isEmail(identifier)) {
+    const found = await UserModel.findOne({ email: identifier }).select("_id email passwordHash").lean();
+    if (found) {
+      user = { _id: found._id.toString(), email: found.email, passwordHash: found.passwordHash };
+      userId = user._id;
     }
-
+  } else {
+    // Registration number login — must be a student
+    const student = await StudentModel.findOne({ registrationNumber: identifier })
+      .select("_id authUserId status")
+      .lean();
     if (student) {
-      userId = student.auth_user_id;
+      userId = student.authUserId.toString();
       studentStatus = student.status;
-      const { data: authUser, error: authUserError } =
-        await admin.auth.admin.getUserById(student.auth_user_id);
-
-      if (authUserError) {
-        throw new PasswordLoginUnavailableError(
-          "Could not resolve the pre-provisioned student account.",
-        );
+      const found = await UserModel.findById(student.authUserId)
+        .select("_id email passwordHash")
+        .lean();
+      if (found) {
+        user = { _id: found._id.toString(), email: found.email, passwordHash: found.passwordHash };
       }
-
-      email = authUser.user.email ?? null;
     }
   }
 
-  const { url, publishableKey } = getSupabaseConfig();
-  const passwordClient = createClient(url, publishableKey, {
-    auth: {
-      autoRefreshToken: false,
-      detectSessionInUrl: false,
-      persistSession: false,
-    },
-  });
-  const authResult = await passwordClient.auth.signInWithPassword({
-    email: email ?? "unknown-account@invalid.example",
-    password,
-  });
+  // Verify password — always run bcrypt to prevent timing attacks
+  const dummyHash = "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+  const passwordMatch = await bcrypt.compare(password, user?.passwordHash ?? dummyHash);
 
-  if (authResult.error) {
-    if (!authResult.error.status || authResult.error.status >= 500) {
-      throw new PasswordLoginUnavailableError(
-        "The Supabase Auth password service is unavailable.",
-      );
-    }
-
-    await recordFailedAttempt(admin, identifierHash, userId);
-    return authResult.error.status === 429
-      ? { kind: "rate_limited", retryAfter: LOCKOUT_WINDOW_SECONDS }
-      : { kind: "invalid_credentials" };
-  }
-
-  const authenticatedUser = authResult.data.user;
-  if (!authenticatedUser || !authResult.data.session) {
-    throw new PasswordLoginUnavailableError(
-      "Supabase Auth returned an incomplete password-login result.",
-    );
-  }
-
-  userId = authenticatedUser.id;
-  const { data: role, error: roleError } = await admin
-    .from("user_roles")
-    .select("role")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  if (roleError) {
-    throw new PasswordLoginUnavailableError(
-      "Could not check the pre-provisioned account role.",
-    );
-  }
-
-  if (!role) {
-    await recordFailedAttempt(admin, identifierHash, userId);
+  if (!user || !passwordMatch) {
+    await recordFailedAttempt(identifierHash, userId);
     return { kind: "invalid_credentials" };
   }
 
-  if (isRegistrationNumberLogin && role.role !== "STUDENT") {
-    await recordFailedAttempt(admin, identifierHash, userId);
+  // Check role
+  const roleRecord = await UserRoleModel.findOne({ userId: user._id }).lean();
+  if (!roleRecord) {
+    await recordFailedAttempt(identifierHash, userId);
     return { kind: "invalid_credentials" };
   }
 
-  if (role.role === "STUDENT") {
+  // Registration number login must map to a STUDENT
+  if (!isEmail(identifier) && roleRecord.role !== "STUDENT") {
+    await recordFailedAttempt(identifierHash, userId);
+    return { kind: "invalid_credentials" };
+  }
+
+  // Active student check
+  if (roleRecord.role === "STUDENT") {
     if (!studentStatus) {
-      const { data: student, error: studentError } = await admin
-        .from("students")
-        .select("id, status")
-        .eq("auth_user_id", userId)
-        .maybeSingle();
-
-      if (studentError) {
-        throw new PasswordLoginUnavailableError(
-          "Could not check the student account status.",
-        );
-      }
-
+      const student = await StudentModel.findOne({ authUserId: user._id })
+        .select("status")
+        .lean();
       studentStatus = student?.status ?? null;
     }
-
     if (studentStatus !== "ACTIVE") {
-      await recordFailedAttempt(admin, identifierHash, userId);
+      await recordFailedAttempt(identifierHash, userId);
       return { kind: "invalid_credentials" };
     }
   }
 
-  const { error: successfulAttemptError } = await admin
-    .from("login_attempts")
-    .insert({
-      user_id: userId,
-      identifier_hash: identifierHash,
+  // Record success + clear rate limit
+  await Promise.all([
+    LoginAttemptModel.create({
+      userId: user._id,
+      identifierHash,
       factor: "PASSWORD_TRANSACTION",
       succeeded: true,
-    });
+    }),
+    AuthRateLimitModel.deleteOne({ identifierHash }),
+  ]);
 
-  if (successfulAttemptError) {
-    throw new PasswordLoginUnavailableError(
-      "Could not record the successful password-login attempt.",
-    );
-  }
-
-  const { error: resetLimitError } = await admin
-    .from("auth_rate_limits")
-    .delete()
-    .eq("identifier_hash", identifierHash);
-
-  if (resetLimitError) {
-    throw new PasswordLoginUnavailableError(
-      "Could not clear the password-login rate limit.",
-    );
-  }
-
+  // Create auth transaction challenge
   const transactionToken = randomBytes(32).toString("base64url");
   const transactionId = randomUUID();
-  const expiresAt = new Date(
-    Date.now() + AUTH_TRANSACTION_TTL_SECONDS * 1000,
-  ).toISOString();
-  const { error: challengeError } = await admin
-    .from("authentication_challenges")
-    .insert({
-      auth_transaction_id: transactionId,
-      user_id: userId,
-      factor: "PASSWORD_TRANSACTION",
-      challenge_hash: hashOpaqueToken(transactionToken),
-      expires_at: expiresAt,
-      verified_at: new Date().toISOString(),
-    });
+  const expiresAt = new Date(Date.now() + AUTH_TRANSACTION_TTL_SECONDS * 1000);
 
-  if (challengeError) {
-    throw new PasswordLoginUnavailableError(
-      "Could not create the temporary authentication transaction.",
-    );
-  }
+  await AuthChallengeModel.create({
+    authTransactionId: transactionId,
+    userId: user._id,
+    factor: "PASSWORD_TRANSACTION",
+    challengeHash: hashOpaqueToken(transactionToken),
+    expiresAt,
+    verifiedAt: new Date(),
+  });
 
   return { kind: "authenticated", transactionToken };
 }

@@ -1,5 +1,6 @@
 import "server-only";
-import { getSupabaseAdminClient } from "@/lib/supabase/admin";
+import { connectToDatabase } from "@/lib/mongodb/connection";
+import { StudentModel } from "@/lib/models";
 
 export class StudentApiError extends Error {
   constructor(message: string) {
@@ -9,16 +10,21 @@ export class StudentApiError extends Error {
 }
 
 export async function getActiveStudentIdentity(authUserId: string) {
-  const admin = getSupabaseAdminClient();
-  const { data: student, error } = await admin
-    .from("students")
-    .select("id, registration_number, programme_id, admission_year, year_of_study, status")
-    .eq("auth_user_id", authUserId)
-    .maybeSingle();
+  await connectToDatabase();
+  const student = await StudentModel.findOne({ authUserId })
+    .select("_id registrationNumber programmeId admissionYear yearOfStudy status")
+    .lean();
 
-  if (error) throw new StudentApiError("Could not load the student account.");
   if (!student || student.status !== "ACTIVE") return null;
-  return student;
+
+  return {
+    id: student._id.toString(),
+    registration_number: student.registrationNumber,
+    programme_id: student.programmeId?.toString() ?? null,
+    admission_year: student.admissionYear,
+    year_of_study: student.yearOfStudy,
+    status: student.status,
+  };
 }
 
 export function apiUnavailable(message: string) {

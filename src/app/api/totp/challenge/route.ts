@@ -6,7 +6,7 @@ import {
   getTotpTransactionCookieName,
   TotpServiceError,
 } from "@/lib/security/totp";
-import { SupabaseConfigurationError } from "@/lib/supabase/config";
+import { MongoConfigurationError } from "@/lib/mongodb/config";
 
 export async function POST(request: NextRequest) {
   if (!isSameOriginRequest(request)) {
@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
     response.cookies.set(cookieName, result.transactionToken, getTotpCookieSettings());
     return response;
   } catch (error) {
-    if (error instanceof SupabaseConfigurationError) {
+    if (error instanceof MongoConfigurationError) {
       return jsonError("Authentication service is not configured.", 503);
     }
     if (error instanceof TotpServiceError) {
